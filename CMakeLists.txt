@@ -31,3 +31,14 @@ foreach(test_name IN ITEMS kvcache_phase1_3_test scheduler_test random_pressure_
     target_link_libraries(${test_name} PRIVATE KV_Cache_lib)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
+
+# ========== 示例：可执行 demo，不注册为测试 ==========
+option(KV_CACHE_BUILD_EXAMPLES "Build examples/demo.cpp" ON)
+
+if(KV_CACHE_BUILD_EXAMPLES)
+    add_executable(kvcache_demo examples/demo.cpp)
+    target_link_libraries(kvcache_demo PRIVATE KV_Cache_lib)
+    # 冒烟测试：demo 必须能跑完（覆盖调度器终止性与停机路径）
+    add_test(NAME kvcache_demo COMMAND kvcache_demo)
+    set_tests_properties(kvcache_demo PROPERTIES LABELS demo TIMEOUT 120)
+endif()

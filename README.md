@@ -7,6 +7,7 @@
 ![CMake](https://img.shields.io/badge/CMake-%E2%89%A53.20-informational)
 ![Tests](https://img.shields.io/badge/tests-61%20unit%20%2B%202%20stress-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![CI](https://github.com/laoyeye831/learn-vllm-paged-kvcache/actions/workflows/ci.yml/badge.svg)](https://github.com/laoyeye831/learn-vllm-paged-kvcache/actions/workflows/ci.yml)
 
 ## 这是什么
 
@@ -93,6 +94,26 @@ ctest --test-dir build --output-on-failure
 - **Windows + MSVC**：请在 *Developer PowerShell for VS* 中执行（该环境自带 `cl.exe` 与 `ninja`），或直接使用 VS Code 的 CMake Tools 插件（已在 `.vscode/settings.json` 中指定 Ninja 生成器）。
 - 如果本机没有 `ninja`，删掉 `-G Ninja` 使用默认生成器即可（多配置生成器下 ctest 需加 `-C Debug`）。
 
+写完后先跑一次 demo，能直观看到前缀复用、写时复制与抢占的效果：
+
+```bash
+./build/kvcache_demo
+```
+
+输出节选（A 段：同 prompt 的第二个请求直接复用物理块，fork 后尾块写入触发 CoW）：
+
+```text
+[2] r2 prefill 同一 prompt: ok=1, 命中块=2, 空闲块=12
+    → 前 2 块直接复用 r1 的物理块（ref_count 变 2），只新分配 1 块
+r2                 block_table=[0(ref=2) 1(ref=2) 3(ref=1)]
+
+[3] fork_sequence(r2) → ref_count 全部 +1，空闲块仍为 12
+son                block_table=[0(ref=3) 1(ref=3) 3(ref=2)]
+
+[4] son decode 一个 token（尾块 ref_count>1 → CoW）
+    尾块 3 → 4，slot=72，空闲块=11
+```
+
 逐个运行测试可看到每个用例的通过情况：
 
 ```bash
@@ -112,6 +133,7 @@ ctest --test-dir build --output-on-failure
 | `scheduler_thread_test` | 后台线程生命周期、并发生产者、Worker 池并行与停机 | 10 |
 | `random_pressure_test` | 随机负载下小池（频繁抢占）与大池（无抢占）结果对拍 | 随机 |
 | `thread_stress_test` | 多生产者 + 调度线程 + Worker 池并发，逐步校验不变量 | 随机 |
+| `kvcache_demo` | 冒烟测试：demo 必须跑完，覆盖调度器终止性与停机路径 | 1 |
 
 所有用例使用自带的 `tests/test_util.h`（`CHECK` / `EXPECT_EQ` / `RUN_TEST`），`check_invariants()` 会在每一步验证：
 
@@ -129,10 +151,24 @@ KV_Cache/
 ├── manager.cpp            # 链式前缀哈希、缓存注册与匹配、请求释放
 ├── other.cpp              # prefill / append_slot(CoW) / append_token / fork_sequence / fake_sample
 ├── scheduler.cpp          # 四阶段 step()、抢占、调度线程与 Worker 池
-├── tests/                 # 单元测试与压力测试
-├── CMakeLists.txt
-└── Log.txt                # 开发日志（每日目标、问题与遗留项）
+├── examples/
+│   └── demo.cpp           # 可执行演示：前缀复用、CoW、跨批次缓存命中、抢占
+├── tests/                 # 单元测试与压力测试，test_util.h 提供断言与不变量检查
+├── docs/
+│   ├── ARCHITECTURE.md    # 分层、数据结构、四阶段调度、锁纪律、不变量
+│   ├── VLLM_MAPPING.md    # 本项目符号 ↔ vLLM 源码位置的逐条对照
+│   └── DEVLOG.md          # 开发日志：每天的目标、踩坑与遗留项
+├── .github/workflows/ci.yml
+└── CMakeLists.txt
 ```
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 模块分层、数据结构、一次请求的生命周期、四阶段 `step()`、引用计数与 CoW、并发与锁纪律、四条不变量 |
+| [docs/VLLM_MAPPING.md](docs/VLLM_MAPPING.md) | 逐条对照 vLLM 的 `BlockAllocator` / `PrefixCachingBlockAllocator` / `Scheduler`，并列出刻意未实现的部分 |
+| [docs/DEVLOG.md](docs/DEVLOG.md) | 7 天开发日志，记录「为什么是 `break` 而不是 `continue`」「为什么 promise 要在锁外 `set_value`」这类决策过程 |
 
 ## 已知限制
 
@@ -148,12 +184,15 @@ KV_Cache/
 
 ## Roadmap
 
+- [x] `examples/demo.cpp`：演示前缀复用、写时复制与抢占
+- [x] `docs/ARCHITECTURE.md` / `docs/VLLM_MAPPING.md` / `docs/DEVLOG.md`
+- [x] GitHub Actions CI（Linux/GCC + Windows/MSVC）
 - [ ] Worker 池改为动态分发（共享原子游标），消除长尾空等
 - [ ] 引入 LRU 空闲块淘汰，替换 FIFO 空闲链表
 - [ ] 把 `BLOCK_SIZE` / `WATER_MARK` 改为运行期可配置
 - [ ] 补充 GPU ↔ CPU swap 语义（当前 `ReqState::SWAPPED` 未被使用）
 - [ ] ThreadSanitizer 下跑通全部并发测试并接入 CI
-- [ ] 添加 `examples/demo.cpp`，直观展示缓存命中率与抢占次数
+- [ ] 统计缓存命中率与块利用率，输出为可对比的指标表
 
 ## 声明
 
