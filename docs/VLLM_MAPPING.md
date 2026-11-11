@@ -21,7 +21,7 @@
 | `block_table` | `vllm/worker/model_runner.py` 的 block tables | `vllm/v1/worker/block_table.py: BlockTable` | 本项目是 `std::vector<int>` 逻辑→物理映射 |
 | `WATER_MARK = 4` | `Scheduler` 的 `watermark`（默认 **0.01**，按块数比例） | 同 | 本项目是绝对块数，vLLM 是比例 |
 
-## 2. 块管理（`manager.cpp`）
+## 2. 块管理（`src/manager.cpp`）
 
 | 本项目 | vLLM (v0) | vLLM (v1) | 差异 |
 |---|---|---|---|
@@ -33,7 +33,7 @@
 | `has_hash` / `hash` 双字段校验 | vLLM 依赖「块被回收时从哈希表移除」保证一致性 | v1 用 `KVCacheBlock.block_hash` 哨兵值 + 引用计数保证 | 本项目选择**惰性验证**：块被 `allocate()` 复用后只清 `has_hash`，命中时发现失效再 `erase`，避免在分配路径上维护哈希表 |
 | `release(req)` | `BlockSpaceManagerV1.free` + `PrefixCachingBlockAllocator.free` | `KVCacheManager.free` | 语义一致：逐个 `dec_ref`，并清空 `block_table` / `slot_mapping` |
 
-## 3. 请求原语（`other.cpp`）
+## 3. 请求原语（`src/other.cpp`）
 
 | 本项目 | vLLM (v0) | 差异 |
 |---|---|---|
@@ -44,7 +44,7 @@
 | `fork_sequence()` | `BlockSpaceManagerV1.fork` / `PrefixCachingBlockAllocator` 的 `_incr_refcount` | 用于 beam search / parallel sampling 共享前缀；本项目仅用于演示与测试共享语义 |
 | `fake_sample()` | `vllm/model_executor/layers/sampler.py` | 本项目是确定性哈希 `(last_token*31 + seq_len) % 50000`，**目的是让「小池 vs 大池」的结果可以直接逐个对拍**，与真实采样无关 |
 
-## 4. 调度（`scheduler.cpp`）
+## 4. 调度（`src/scheduler.cpp`）
 
 | 本项目 | vLLM (v0) | 差异 |
 |---|---|---|

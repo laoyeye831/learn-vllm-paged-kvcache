@@ -13,7 +13,7 @@ int fake_sample(const Request& r)
 }
 
 // ====== 其他函数 ======
-bool prefill(const std::vector<int>& prompt_tokens, Request& request,BlockManager& manager)
+bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManager& manager)
 {
     auto allocator = manager.get_allocator();
     manager.release(request); // 同一个 Request 重复 prefill 时先归还旧资源
@@ -38,10 +38,10 @@ bool prefill(const std::vector<int>& prompt_tokens, Request& request,BlockManage
         request.block_table.push_back(id);
     }
 
-    for(int i = matched_blocks_num;i < block_nums;i++)
+    for(int i = matched_blocks_num; i < block_nums; i++)
     {
         int temp_id = allocator->allocate(); // 获取空闲物理块id
-        if(temp_id < 0) // 失败时回滚：复用块和新分配块都只释放本请求持有的引用
+        if(temp_id < 0)                      // 失败时回滚：复用块和新分配块都只释放本请求持有的引用
         {
             manager.release(request);
             return false;
@@ -50,10 +50,10 @@ bool prefill(const std::vector<int>& prompt_tokens, Request& request,BlockManage
     }
 
     request.all_tokens = prompt_tokens;
-    for(int t = 0;t < N;t++)
+    for(int t = 0; t < N; t++)
     {
         int logical_block_idx = t / BLOCK_SIZE; // 计算每个token属于哪个逻辑块
-        int offset = t % BLOCK_SIZE; // 计算块内偏移
+        int offset = t % BLOCK_SIZE;            // 计算块内偏移
         int physical_block_id = request.block_table[logical_block_idx];
         int slot_id = physical_block_id * BLOCK_SIZE + offset;
         request.slot_mapping.push_back(slot_id);
@@ -66,7 +66,7 @@ bool prefill(const std::vector<int>& prompt_tokens, Request& request,BlockManage
     return true;
 }
 
-int append_slot(BlockManager& manager,Request& request)
+int append_slot(BlockManager& manager, Request& request)
 {
     auto allocator = manager.get_allocator();
     int N = request.sequence_length;
@@ -112,9 +112,9 @@ int append_slot(BlockManager& manager,Request& request)
     return slot_id;
 }
 
-void append_token(BlockManager& manager,Request& request,int token)
+void append_token(BlockManager& manager, Request& request, int token)
 {
-     int N = request.sequence_length;
+    int N = request.sequence_length;
 
     // 仅当 token 序列与长度保持同步时才记录，以保证哈希基于真实内容
     if(token >= 0 && static_cast<int>(request.all_tokens.size()) == N)
@@ -131,15 +131,13 @@ void append_token(BlockManager& manager,Request& request,int token)
     }
 }
 
-Request fork_sequence(Request& father_request,BlockAllocator& allocator)
+Request fork_sequence(Request& father_request, BlockAllocator& allocator)
 {
     Request son = father_request;
     son.slot_mapping.clear(); // 清空旧的 slot_mapping
-    for(auto &id : son.block_table)
+    for(auto& id : son.block_table)
     {
         allocator.inc_ref(id);
     }
     return son;
 }
-
-

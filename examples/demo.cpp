@@ -27,19 +27,25 @@ using namespace std::chrono;
 static std::vector<int> make_tokens(int base, int len)
 {
     std::vector<int> v(static_cast<size_t>(len));
-    for (int i = 0; i < len; ++i) v[static_cast<size_t>(i)] = base + i;
+    for(int i = 0; i < len; ++i)
+        v[static_cast<size_t>(i)] = base + i;
     return v;
 }
 
 static const char* state_name(ReqState s)
 {
-    switch (s)
+    switch(s)
     {
-    case ReqState::WAITING:  return "WAITING";
-    case ReqState::RUNNING:  return "RUNNING";
-    case ReqState::SWAPPED:  return "SWAPPED";
-    case ReqState::FINISHED: return "FINISHED";
-    case ReqState::ABORTED:  return "ABORTED";
+    case ReqState::WAITING:
+        return "WAITING";
+    case ReqState::RUNNING:
+        return "RUNNING";
+    case ReqState::SWAPPED:
+        return "SWAPPED";
+    case ReqState::FINISHED:
+        return "FINISHED";
+    case ReqState::ABORTED:
+        return "ABORTED";
     }
     return "?";
 }
@@ -47,7 +53,7 @@ static const char* state_name(ReqState s)
 static void print_blocks(const char* tag, const Request& r, BlockAllocator& alloc)
 {
     printf("  %-18s block_table=[", tag);
-    for (size_t i = 0; i < r.block_table.size(); ++i)
+    for(size_t i = 0; i < r.block_table.size(); ++i)
         printf("%s%d(ref=%d)", i ? " " : "", r.block_table[i], alloc.ref_count_of(r.block_table[i]));
     printf("]\n");
 }
@@ -73,7 +79,8 @@ struct Trace
 static std::shared_ptr<Trace> attach_trace(Scheduler& sched, BlockAllocator& alloc)
 {
     auto t = std::make_shared<Trace>();
-    sched.set_step_hook([&alloc, t](const Scheduler& s) {
+    sched.set_step_hook([&alloc, t](const Scheduler& s)
+                        {
         const int free_blocks = alloc.num_free_blocks();
         if (free_blocks < t->min_free) t->min_free = free_blocks;
 
@@ -92,8 +99,7 @@ static std::shared_ptr<Trace> attach_trace(Scheduler& sched, BlockAllocator& all
             t->prev_run = running.size();
             t->prev_wait = waiting.size();
             t->prev_pre = pre;
-        }
-    });
+        } });
     return t;
 }
 
@@ -112,7 +118,7 @@ static void print_results(const char* tag,
     printf("  %s：\n", tag);
     printf("    %-5s %-8s %-8s %-10s %-11s %s\n",
            "req", "prompt", "max_new", "generated", "cached_blk", "state");
-    for (size_t i = 0; i < reqs.size(); ++i)
+    for(size_t i = 0; i < reqs.size(); ++i)
     {
         auto it = trace->hits.find(reqs[i].get());
         int cached = (it == trace->hits.end()) ? 0 : it->second;
@@ -203,7 +209,7 @@ static void demo_prefix_cache_waves()
     std::vector<Spec> specs1;
     std::vector<std::shared_ptr<Request>> reqs1;
     std::vector<std::future<void>> futures1;
-    for (int i = 0; i < 3; ++i)
+    for(int i = 0; i < 3; ++i)
     {
         specs1.push_back(Spec{static_cast<int>(common.size()), 2});
         auto r = std::make_shared<Request>();
@@ -213,7 +219,8 @@ static void demo_prefix_cache_waves()
         futures1.push_back(sched.add_request(r));
     }
     sched.start();
-    for (auto& f : futures1) f.wait();
+    for(auto& f : futures1)
+        f.wait();
     print_results("第一波结果（cached_blk=3 是 3 个满块；#1/#2 命中的是 #0 刚登记的块）",
                   specs1, reqs1, trace);
     printf("    峰值占用 %d 块 = 3 个共享前缀块 + 3 个各自 decode 块（不共享则需 12 块）\n",
@@ -233,10 +240,11 @@ static void demo_prefix_cache_waves()
     std::vector<Spec> specs2;
     std::vector<std::shared_ptr<Request>> reqs2;
     std::vector<std::future<void>> futures2;
-    for (int i = 0; i < 3; ++i)
+    for(int i = 0; i < 3; ++i)
     {
         std::vector<int> p = common;
-        for (int t = 0; t < 16; ++t) p.push_back(9000 + i * 100 + t);
+        for(int t = 0; t < 16; ++t)
+            p.push_back(9000 + i * 100 + t);
 
         // 提交前查一次，能看到「已被第一波登记」的 3 个块
         auto preview = mgr.match_prefix(p);
@@ -252,7 +260,8 @@ static void demo_prefix_cache_waves()
         futures2.push_back(sched.add_request(r));
     }
 
-    for (auto& f : futures2) f.wait();
+    for(auto& f : futures2)
+        f.wait();
     sched.stop(true);
     print_results("第二波结果（提交前预查已命中 3 块；cached_blk 还含自己登记的第 4 块）",
                   specs2, reqs2, trace);
@@ -286,7 +295,7 @@ static void demo_preemption()
     std::vector<std::future<void>> futures;
 
     printf("  提交 %d 个请求：prompt=32 tokens, max_new=56（每个最终需 6 块）\n", kNumReq);
-    for (int i = 0; i < kNumReq; ++i)
+    for(int i = 0; i < kNumReq; ++i)
     {
         auto p = make_tokens(4000 + i * 700, 32);
         specs.push_back(Spec{32, 56});
@@ -298,13 +307,15 @@ static void demo_preemption()
     }
 
     sched.start();
-    for (auto& f : futures) f.wait();
+    for(auto& f : futures)
+        f.wait();
     sched.stop(true);
 
     print_results("结果（抢占不丢输出，靠重算恢复）", specs, reqs, trace);
     printf("    总步数=%lld，抢占次数=%d，剩余空闲块=%d/%d\n",
            sched.num_steps(), sched.num_preemptions(),
-           alloc.num_free_blocks(), alloc.num_blocks());    printf("    抢占语义：释放 victim 的块 → 标记 WAITING → 放回等待队列队首；\n");
+           alloc.num_free_blocks(), alloc.num_blocks());
+    printf("    抢占语义：释放 victim 的块 → 标记 WAITING → 放回等待队列队首；\n");
     printf("              恢复时对 all_tokens（prompt + 已生成 token）重新 prefill，即「重算」\n");
 }
 

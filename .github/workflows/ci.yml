@@ -31,3 +31,46 @@ jobs:
       - name: Test
         # 多配置生成器（Windows 上的 MSVC）需要 -C Debug 才能定位用例
         run: ctest --test-dir build -C Debug --output-on-failure
+
+  thread-sanitizer:
+    name: Linux / ThreadSanitizer
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lower ASLR entropy
+        # 新内核的高熵 ASLR 会让 TSan 报 "unexpected memory mapping"
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DKV_CACHE_ENABLE_TSAN=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+
+  format:
+    name: Linux / clang-format
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        # 版本与 .clang-format 生成时保持一致，避免不同版本的排版差异导致误报
+        run: pip install clang-format==23.1.5
+
+      - name: Check formatting
+        run: >
+          clang-format --dry-run --Werror
+          include/kvcache.h
+          src/allocator.cpp src/manager.cpp src/other.cpp src/scheduler.cpp
+          tests/test_util.h
+          tests/kvcache_phase1_3_test.cpp tests/scheduler_test.cpp
+          tests/scheduler_thread_test.cpp tests/random_pressure_test.cpp tests/thread_stress_test.cpp
+          examples/demo.cpp

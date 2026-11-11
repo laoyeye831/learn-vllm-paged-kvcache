@@ -16,7 +16,8 @@ using namespace std::chrono;
 // =====================================================================
 //  工作负载生成
 // =====================================================================
-struct RequestSpec {
+struct RequestSpec
+{
     int id{0};
     std::vector<int> prompt;
     int max_new_tokens{0};
@@ -30,26 +31,34 @@ static std::vector<RequestSpec> generate_specs(std::mt19937& rng, int num_reques
     std::uniform_int_distribution<int> prefix_choice(0, 3); // 0..2 用公共前缀，3 不用
 
     std::vector<std::vector<int>> prefixes;
-    for (int p = 0; p < 3; ++p) {
+    for(int p = 0; p < 3; ++p)
+    {
         std::vector<int> pre(prompt_len_dist(rng));
-        for (auto& t : pre) t = token_dist(rng);
+        for(auto& t : pre)
+            t = token_dist(rng);
         prefixes.push_back(std::move(pre));
     }
 
     std::vector<RequestSpec> specs;
     specs.reserve(num_requests);
-    for (int i = 0; i < num_requests; ++i) {
+    for(int i = 0; i < num_requests; ++i)
+    {
         RequestSpec spec;
         spec.id = i;
         int total_len = prompt_len_dist(rng);
         int choice = prefix_choice(rng);
-        if (choice < 3) {
+        if(choice < 3)
+        {
             const auto& pre = prefixes[choice];
             int plen = std::min<int>(pre.size(), total_len);
             spec.prompt.assign(pre.begin(), pre.begin() + plen);
-            for (int j = plen; j < total_len; ++j) spec.prompt.push_back(token_dist(rng));
-        } else {
-            for (int j = 0; j < total_len; ++j) spec.prompt.push_back(token_dist(rng));
+            for(int j = plen; j < total_len; ++j)
+                spec.prompt.push_back(token_dist(rng));
+        }
+        else
+        {
+            for(int j = 0; j < total_len; ++j)
+                spec.prompt.push_back(token_dist(rng));
         }
         spec.max_new_tokens = gen_len_dist(rng);
         specs.push_back(std::move(spec));
@@ -67,8 +76,9 @@ static int generate_pool_size(std::mt19937& rng)
 // =====================================================================
 //  跑一次工作负载
 // =====================================================================
-struct Outcome {
-    std::map<int, std::vector<int>> generated;   // id -> 该请求生成的 token 序列
+struct Outcome
+{
+    std::map<int, std::vector<int>> generated; // id -> 该请求生成的 token 序列
     int free_blocks_at_end{-1};
     int total_blocks{0};
     int aborted{0};
@@ -85,13 +95,14 @@ static Outcome run_baseline(const std::vector<RequestSpec>& specs, int pool_size
 
     long long hook_steps = 0;
     sched.set_sampler(fake_sample);
-    sched.set_step_hook([&](const Scheduler& s) {
+    sched.set_step_hook([&](const Scheduler& s)
+                        {
         check_invariants(s, allocator);
-        ++hook_steps;
-    });
+        ++hook_steps; });
 
     std::vector<std::shared_ptr<Request>> reqs;
-    for (const auto& spec : specs) {
+    for(const auto& spec : specs)
+    {
         auto r = std::make_shared<Request>();
         r->all_tokens = spec.prompt;
         r->max_new_tokens = spec.max_new_tokens;
@@ -100,8 +111,10 @@ static Outcome run_baseline(const std::vector<RequestSpec>& specs, int pool_size
     }
 
     int steps = 0;
-    while (sched.has_work()) {
-        if (steps++ >= 100000) {
+    while(sched.has_work())
+    {
+        if(steps++ >= 100000)
+        {
             fprintf(stderr, "[baseline] exceeded max_steps seed=%u pool=%d\n", seed, pool_size);
             std::abort();
         }
@@ -113,12 +126,13 @@ static Outcome run_baseline(const std::vector<RequestSpec>& specs, int pool_size
     out.free_blocks_at_end = allocator.num_free_blocks();
     out.steps = sched.num_steps();
     out.hook_steps = hook_steps;
-    for (size_t i = 0; i < reqs.size(); ++i) {
+    for(size_t i = 0; i < reqs.size(); ++i)
+    {
         const auto& r = reqs[i];
-        if (r->s == ReqState::ABORTED) out.aborted++;
+        if(r->s == ReqState::ABORTED) out.aborted++;
         int n_gen = r->num_generated_tokens;
         int start = static_cast<int>(r->all_tokens.size()) - n_gen;
-        if (start < 0) start = 0;
+        if(start < 0) start = 0;
         out.generated[specs[i].id] =
             std::vector<int>(r->all_tokens.begin() + start, r->all_tokens.end());
     }
@@ -135,22 +149,28 @@ static Outcome run_threaded(const std::vector<RequestSpec>& specs, int pool_size
 
     long long hook_steps = 0;
     sched.set_sampler(fake_sample);
-    sched.set_step_hook([&](const Scheduler& s) {
+    sched.set_step_hook([&](const Scheduler& s)
+                        {
         check_invariants(s, allocator);   // 在调度线程里执行，此时没有其他线程改状态
-        ++hook_steps;
-    });
+        ++hook_steps; });
     sched.start();
 
     // 每个请求的提交顺序随机，但每个请求自身的输出只取决于自己的 token 序列
     // 提交时记下它在 specs 中的下标：不同请求可能有完全相同的 prompt，不能靠内容反查
-    struct Submitted { size_t spec_index; std::shared_ptr<Request> req; };
+    struct Submitted
+    {
+        size_t spec_index;
+        std::shared_ptr<Request> req;
+    };
     std::vector<std::vector<Submitted>> submitted(num_producers);
     std::vector<std::vector<std::future<void>>> futures(num_producers);
 
     std::vector<std::thread> producers;
     producers.reserve(num_producers);
-    for (int p = 0; p < num_producers; ++p) {
-        producers.emplace_back([&, p] {
+    for(int p = 0; p < num_producers; ++p)
+    {
+        producers.emplace_back([&, p]
+                               {
             std::mt19937 rng(seed * 131u + static_cast<uint32_t>(p));
             std::uniform_int_distribution<int> delay_us(0, 2000);
             for (size_t i = p; i < specs.size(); i += num_producers) {
@@ -160,17 +180,18 @@ static Outcome run_threaded(const std::vector<RequestSpec>& specs, int pool_size
                 submitted[p].push_back(Submitted{i, r});
                 futures[p].push_back(sched.add_request(r));
                 if (delay_us(rng) > 0) std::this_thread::sleep_for(microseconds(delay_us(rng)));
-            }
-        });
+            } });
     }
-    for (auto& t : producers) t.join();
+    for(auto& t : producers)
+        t.join();
 
     bool all_ready = true;
-    for (auto& fs : futures)
-        for (auto& f : fs) all_ready = (f.wait_for(seconds(30)) == std::future_status::ready) && all_ready;
+    for(auto& fs : futures)
+        for(auto& f : fs)
+            all_ready = (f.wait_for(seconds(30)) == std::future_status::ready) && all_ready;
     CHECK(all_ready);
 
-    sched.stop(true);           // 排空：所有请求都应已完成
+    sched.stop(true); // 排空：所有请求都应已完成
 
     Outcome out;
     out.total_blocks = allocator.num_blocks();
@@ -179,15 +200,17 @@ static Outcome run_threaded(const std::vector<RequestSpec>& specs, int pool_size
     out.hook_steps = hook_steps;
 
     // 按提交时记录的下标归位（不同请求的 prompt 可能完全相同，不能按内容反查）
-    for (int p = 0; p < num_producers; ++p) {
-        for (const auto& s : submitted[p]) {
+    for(int p = 0; p < num_producers; ++p)
+    {
+        for(const auto& s : submitted[p])
+        {
             const auto& r = s.req;
-            if (r->s == ReqState::ABORTED) out.aborted++;
+            if(r->s == ReqState::ABORTED) out.aborted++;
             int n_gen = r->num_generated_tokens;
             int start = static_cast<int>(r->all_tokens.size()) - n_gen;
-            if (start < 0) start = 0;
+            if(start < 0) start = 0;
             int id = specs[s.spec_index].id;
-            CHECK(out.generated.find(id) == out.generated.end());   // 每个请求只出现一次
+            CHECK(out.generated.find(id) == out.generated.end()); // 每个请求只出现一次
             out.generated[id] =
                 std::vector<int>(r->all_tokens.begin() + start, r->all_tokens.end());
         }
@@ -209,7 +232,7 @@ static void run_one(uint32_t seed, int num_requests, int num_workers, int num_pr
 
     CHECK(base.aborted == 0);
     CHECK(base.free_blocks_at_end == base.total_blocks);
-    CHECK(base.hook_steps == base.steps);            // 每一步都检查过不变量
+    CHECK(base.hook_steps == base.steps); // 每一步都检查过不变量
 
     CHECK(mt.aborted == 0);
     CHECK(mt.free_blocks_at_end == mt.total_blocks);
@@ -219,16 +242,20 @@ static void run_one(uint32_t seed, int num_requests, int num_workers, int num_pr
     CHECK(base.generated.size() == specs.size());
     CHECK(mt.generated.size() == specs.size());
 
-    for (const auto& spec : specs) {
+    for(const auto& spec : specs)
+    {
         auto itb = base.generated.find(spec.id);
         auto itm = mt.generated.find(spec.id);
         CHECK(itb != base.generated.end());
         CHECK(itm != mt.generated.end());
-        if (itb->second != itm->second) {
+        if(itb->second != itm->second)
+        {
             fprintf(stderr, "Mismatch seed=%u id=%d pool=%d\n  base: ", seed, spec.id, pool);
-            for (int t : itb->second) fprintf(stderr, "%d ", t);
+            for(int t : itb->second)
+                fprintf(stderr, "%d ", t);
             fprintf(stderr, "\n  mt  : ");
-            for (int t : itm->second) fprintf(stderr, "%d ", t);
+            for(int t : itm->second)
+                fprintf(stderr, "%d ", t);
             fprintf(stderr, "\n");
             std::abort();
         }
@@ -248,10 +275,10 @@ static bool hook_detects_corruption()
 
     bool detected = false;
     sched.set_sampler(fake_sample);
-    sched.set_step_hook([&](const Scheduler& s) {
+    sched.set_step_hook([&](const Scheduler& s)
+                        {
         check_invariants(s, allocator);
-        detected = true;
-    });
+        detected = true; });
 
     auto r = std::make_shared<Request>();
     r->all_tokens = std::vector<int>(16, 7);
@@ -272,7 +299,7 @@ int main(int argc, char** argv)
     std::cout << "\n=== hook_is_wired ===\n";
     int before = g_fail_count;
     hook_detects_corruption();
-    if (g_fail_count == before) std::cout << "  [OK]\n";
+    if(g_fail_count == before) std::cout << "  [OK]\n";
 
     // 固定种子，失败时可单独复现
     const std::vector<uint32_t> seeds = {1, 2, 3, 7, 42, 123, 2024, 9999, 12345, 65535};
@@ -280,10 +307,12 @@ int main(int argc, char** argv)
     // 额外种子由命令行参数控制，便于长时间浸泡测试
     std::vector<uint32_t> all = seeds;
     int extra = argc > 1 ? std::atoi(argv[1]) : 0;
-    for (int i = 0; i < extra; ++i) all.push_back(200000u + i);
+    for(int i = 0; i < extra; ++i)
+        all.push_back(200000u + i);
 
     int n = 0;
-    for (uint32_t seed : all) {
+    for(uint32_t seed : all)
+    {
         std::mt19937 rng(seed ^ 0x9E3779B9u);
         std::uniform_int_distribution<int> req_dist(8, 30);
         std::uniform_int_distribution<int> worker_dist(2, 4);
@@ -297,7 +326,8 @@ int main(int argc, char** argv)
     }
 
     printf("\nthreaded stress runs: %d\n", n);
-    if (g_fail_count == 0) {
+    if(g_fail_count == 0)
+    {
         std::cout << "\n所有测试通过 ✅\n";
         return 0;
     }

@@ -11,20 +11,20 @@ flowchart TB
         DEMO["examples/demo.cpp<br/>tests/*.cpp"]
     end
 
-    subgraph L2["调度层：scheduler.cpp"]
+    subgraph L2["调度层：src/scheduler.cpp"]
         SCH["Scheduler<br/>准入 / 抢占 / 批次组装 / 生命周期"]
         POOL["Worker 池<br/>sample_batch_parallel()"]
     end
 
-    subgraph L1["管理层：manager.cpp"]
+    subgraph L1["管理层：src/manager.cpp"]
         BM["BlockManager<br/>前缀哈希注册与匹配、请求释放"]
     end
 
-    subgraph L0["存储层：allocator.cpp"]
+    subgraph L0["存储层：src/allocator.cpp"]
         BALLOC["BlockAllocator<br/>物理块池 + 引用计数 + 空闲链表"]
     end
 
-    subgraph L05["原语层：other.cpp"]
+    subgraph L05["原语层：src/other.cpp"]
         PRIM["prefill / append_slot / append_token / fork_sequence / fake_sample"]
     end
 
@@ -41,11 +41,11 @@ flowchart TB
 
 | 文件 | 职责 | 对外暴露 |
 |---|---|---|
-| `kvcache.h` | 全部数据结构与接口声明 | `PhysicalBlock` / `Request` / `ReqState` / `BlockAllocator` / `BlockManager` / `Scheduler` |
-| `allocator.cpp` | 物理块的分配、释放、引用计数 | `BlockAllocator` 成员函数 |
-| `manager.cpp` | 链式前缀哈希、缓存表、请求释放 | `BlockManager` 成员函数 |
-| `other.cpp` | 请求生命周期的原语操作 | `prefill` / `append_slot` / `append_token` / `fork_sequence` / `fake_sample` |
-| `scheduler.cpp` | 调度循环、抢占、后台线程与 Worker 池 | `Scheduler` 成员函数 |
+| `include/kvcache.h` | 全部数据结构与接口声明 | `PhysicalBlock` / `Request` / `ReqState` / `BlockAllocator` / `BlockManager` / `Scheduler` |
+| `src/allocator.cpp` | 物理块的分配、释放、引用计数 | `BlockAllocator` 成员函数 |
+| `src/manager.cpp` | 链式前缀哈希、缓存表、请求释放 | `BlockManager` 成员函数 |
+| `src/other.cpp` | 请求生命周期的原语操作 | `prefill` / `append_slot` / `append_token` / `fork_sequence` / `fake_sample` |
+| `src/scheduler.cpp` | 调度循环、抢占、后台线程与 Worker 池 | `Scheduler` 成员函数 |
 
 ## 2. 核心数据结构
 

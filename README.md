@@ -94,7 +94,23 @@ ctest --test-dir build --output-on-failure
 - **Windows + MSVC**：请在 *Developer PowerShell for VS* 中执行（该环境自带 `cl.exe` 与 `ninja`），或直接使用 VS Code 的 CMake Tools 插件（已在 `.vscode/settings.json` 中指定 Ninja 生成器）。
 - 如果本机没有 `ninja`，删掉 `-G Ninja` 使用默认生成器即可（多配置生成器下 ctest 需加 `-C Debug`）。
 
-写完后先跑一次 demo，能直观看到前缀复用、写时复制与抢占的效果：
+### 构建选项
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `KV_CACHE_ENABLE_TSAN` | `OFF` | 启用 ThreadSanitizer（仅 GCC/Clang，MSVC 会直接报错）。开启后并发测试带 `concurrency` 标签 |
+| `KV_CACHE_BUILD_EXAMPLES` | `ON` | 是否构建 `examples/demo.cpp` |
+
+```bash
+# 用 ThreadSanitizer 跑并发测试
+cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DKV_CACHE_ENABLE_TSAN=ON
+cmake --build build-tsan --parallel
+ctest --test-dir build-tsan --output-on-failure
+```
+
+> 新内核的高熵 ASLR 会让 TSan 报 `unexpected memory mapping`，先执行 `sudo sysctl vm.mmap_rnd_bits=28`（CI 里已这样做）。
+
+构建完成后先跑一次 demo，能直观看到前缀复用、写时复制与抢占的效果：
 
 ```bash
 ./build/kvcache_demo
@@ -135,6 +151,8 @@ son                block_table=[0(ref=3) 1(ref=3) 3(ref=2)]
 | `thread_stress_test` | 多生产者 + 调度线程 + Worker 池并发，逐步校验不变量 | 随机 |
 | `kvcache_demo` | 冒烟测试：demo 必须跑完，覆盖调度器终止性与停机路径 | 1 |
 
+全部用例在 **GCC 11（Linux）** 与 **MSVC 19.4（Windows）** 下通过，且在 **ThreadSanitizer** 下零告警；库代码在 `-Wall -Wextra` 下无警告。
+
 所有用例使用自带的 `tests/test_util.h`（`CHECK` / `EXPECT_EQ` / `RUN_TEST`），`check_invariants()` 会在每一步验证：
 
 - 每个物理块的 `ref_count` 等于所有活跃请求引用它的次数
@@ -146,11 +164,13 @@ son                block_table=[0(ref=3) 1(ref=3) 3(ref=2)]
 
 ```
 KV_Cache/
-├── kvcache.h              # 数据结构与接口：PhysicalBlock / Request / BlockAllocator / BlockManager / Scheduler
-├── allocator.cpp          # 物理块分配、引用计数
-├── manager.cpp            # 链式前缀哈希、缓存注册与匹配、请求释放
-├── other.cpp              # prefill / append_slot(CoW) / append_token / fork_sequence / fake_sample
-├── scheduler.cpp          # 四阶段 step()、抢占、调度线程与 Worker 池
+├── include/
+│   └── kvcache.h          # 数据结构与接口：PhysicalBlock / Request / BlockAllocator / BlockManager / Scheduler
+├── src/
+│   ├── allocator.cpp      # 物理块分配、引用计数
+│   ├── manager.cpp        # 链式前缀哈希、缓存注册与匹配、请求释放
+│   ├── other.cpp          # prefill / append_slot(CoW) / append_token / fork_sequence / fake_sample
+│   └── scheduler.cpp      # 四阶段 step()、抢占、调度线程与 Worker 池
 ├── examples/
 │   └── demo.cpp           # 可执行演示：前缀复用、CoW、跨批次缓存命中、抢占
 ├── tests/                 # 单元测试与压力测试，test_util.h 提供断言与不变量检查
@@ -158,6 +178,7 @@ KV_Cache/
 │   ├── ARCHITECTURE.md    # 分层、数据结构、四阶段调度、锁纪律、不变量
 │   ├── VLLM_MAPPING.md    # 本项目符号 ↔ vLLM 源码位置的逐条对照
 │   └── DEVLOG.md          # 开发日志：每天的目标、踩坑与遗留项
+├── .clang-format          # 与现有代码风格对齐的格式化配置
 ├── .github/workflows/ci.yml
 └── CMakeLists.txt
 ```
@@ -169,6 +190,17 @@ KV_Cache/
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 模块分层、数据结构、一次请求的生命周期、四阶段 `step()`、引用计数与 CoW、并发与锁纪律、四条不变量 |
 | [docs/VLLM_MAPPING.md](docs/VLLM_MAPPING.md) | 逐条对照 vLLM 的 `BlockAllocator` / `PrefixCachingBlockAllocator` / `Scheduler`，并列出刻意未实现的部分 |
 | [docs/DEVLOG.md](docs/DEVLOG.md) | 7 天开发日志，记录「为什么是 `break` 而不是 `continue`」「为什么 promise 要在锁外 `set_value`」这类决策过程 |
+
+## 代码风格
+
+- 代码注释为**中文**；数据结构与接口集中在 `include/kvcache.h`，实现按职责拆到 `src/`。
+- 使用仓库根目录的 [.clang-format](.clang-format)（配置按现有代码风格定制：4 空格缩进、Allman 大括号、`if(` 前不加空格、不重排 include）：
+
+```bash
+clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
+```
+
+- CI 会用 `clang-format --dry-run --Werror` 校验格式，版本固定为 `23.1.5`。
 
 ## 已知限制
 
@@ -186,12 +218,12 @@ KV_Cache/
 
 - [x] `examples/demo.cpp`：演示前缀复用、写时复制与抢占
 - [x] `docs/ARCHITECTURE.md` / `docs/VLLM_MAPPING.md` / `docs/DEVLOG.md`
-- [x] GitHub Actions CI（Linux/GCC + Windows/MSVC）
+- [x] GitHub Actions CI（Linux/GCC + Windows/MSVC + ThreadSanitizer + clang-format）
+- [x] 源码整理为 `include/` + `src/` 布局，统一 clang-format 风格
 - [ ] Worker 池改为动态分发（共享原子游标），消除长尾空等
 - [ ] 引入 LRU 空闲块淘汰，替换 FIFO 空闲链表
 - [ ] 把 `BLOCK_SIZE` / `WATER_MARK` 改为运行期可配置
 - [ ] 补充 GPU ↔ CPU swap 语义（当前 `ReqState::SWAPPED` 未被使用）
-- [ ] ThreadSanitizer 下跑通全部并发测试并接入 CI
 - [ ] 统计缓存命中率与块利用率，输出为可对比的指标表
 
 ## 声明

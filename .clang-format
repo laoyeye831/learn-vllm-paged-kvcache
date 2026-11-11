@@ -1,0 +1,35 @@
+# 与仓库现有代码风格对齐，供新代码使用：
+#   clang-format -i src/*.cpp include/*.h tests/*.cpp examples/*.cpp
+# 注释保留 UTF-8 中文，不重排。
+BasedOnStyle: LLVM
+Language: Cpp
+
+Standard: c++17
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 0
+
+AccessModifierOffset: -4
+AlignAfterOpenBracket: Align
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakAfterReturnType: None
+BinPackArguments: true
+BinPackParameters: true
+BreakBeforeBraces: Allman
+ConstructorInitializerIndentWidth: 4
+ContinuationIndentWidth: 4
+PointerAlignment: Left
+ReferenceAlignment: Left
+SpaceAfterCStyleCast: false
+# 作者习惯：if( / for( / while( 不加空格
+SpaceBeforeParens: Never
+SortIncludes: Never
+ReflowComments: false
+MaxEmptyLinesToKeep: 2
+
+# enum class 与 struct 保持作者手写对齐
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
