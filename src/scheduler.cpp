@@ -232,7 +232,9 @@ void Scheduler::step()
     int num_blocks = allocator->num_blocks();
 
     // 阶段一：先清空收件箱进入waiting_queue
-    std::vector<PendingCompletion> finished; // 收集需在锁外唤醒的 promise
+    // 本步内完成的 promise 统一收集，等到 step() 末尾（step_hook_ 之后）再唤醒，
+    // 否则等待者可能与本线程的 step_hook_ 并发访问同一份统计状态（TSan: data race）
+    std::vector<PendingCompletion> finished;
     {
         std::unique_lock<std::mutex> lock(sched_mutex_);     // 对inbox_操作（与add_request竞争）
         std::unique_lock<std::mutex> lock_p(pending_mutex_); // 对pending_操作
@@ -256,11 +258,6 @@ void Scheduler::step()
             inbox_.erase(temp);
         }
     }
-    // 锁外 set_value：唤醒的调用方不会卡在 add_request 的锁上
-    for(auto& pc : finished)
-        pc.done.set_value();
-    if(!finished.empty() && unfinished.load() == 0) sched_cv_.notify_all();
-
     // 阶段二：挨个看看是否该抢占
     bool preempted = false;
     std::vector<std::shared_ptr<Request>> batch; // 本step能执行的请求
@@ -307,7 +304,7 @@ void Scheduler::step()
     sample_batch_parallel(batch, new_tokens);
 
     // 收集已结束请求的 promise，锁外统一 fire
-    finished.clear();
+    // （finished 中可能已有阶段一被中止的请求，这里不能清空）
     {
         std::unique_lock<std::mutex> lock_p(pending_mutex_); // 保护 pending_
         std::unique_lock<std::mutex> lock_r(running_mutex_); // 保护 running_queue_
@@ -334,16 +331,17 @@ void Scheduler::step()
     }
     // 两把锁在这里析构释放
 
-    // 锁外 set_value：唤醒不再堵 add_request
+    // 本步到此结束：Worker 已全部收工、锁已释放，可以安全地做检查/统计
+    ++num_steps_;
+    if(step_hook_) step_hook_(*this);
+
+    // 锁外 set_value：唤醒不再堵 add_request。
+    // 必须放在 step_hook_ 之后，保证本步的全部写入都 happens-before 调用方 wait() 返回
     for(auto& pc : finished)
     {
         pc.done.set_value();
     }
     if(!finished.empty() && unfinished.load() == 0) sched_cv_.notify_all();
-
-    // 本步到此结束：Worker 已全部收工、锁已释放，可以安全地做检查/统计
-    ++num_steps_;
-    if(step_hook_) step_hook_(*this);
 }
 
 void Scheduler::run()

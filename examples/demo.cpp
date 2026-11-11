@@ -247,6 +247,8 @@ static void demo_prefix_cache_waves()
             p.push_back(9000 + i * 100 + t);
 
         // 提交前查一次，能看到「已被第一波登记」的 3 个块
+        // 预查必须放在所有 add_request() 之前：BlockManager 只由调度线程改，
+        // 一旦有请求入队，调度线程就可能 prefill 并写哈希表，主线程再查就是数据竞争
         auto preview = mgr.match_prefix(p);
         printf("    req#%d 提交前预查：命中 %d 块 / 共需 %d 块\n", i,
                static_cast<int>(preview.cached_blocks.size()),
@@ -257,8 +259,9 @@ static void demo_prefix_cache_waves()
         r->all_tokens = p;
         r->max_new_tokens = 2;
         reqs2.push_back(r);
-        futures2.push_back(sched.add_request(r));
     }
+    for(auto& r : reqs2)
+        futures2.push_back(sched.add_request(r));
 
     for(auto& f : futures2)
         f.wait();
