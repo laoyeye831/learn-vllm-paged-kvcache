@@ -116,24 +116,39 @@ ctest --test-dir build-tsan --output-on-failure
 
 ### 运行 demo
 
+![KV cache demo](docs/demo.gif)
+
 构建完成后先跑一次 demo，能直观看到前缀复用、写时复制与抢占的效果：
 
 ```bash
-./build/kvcache_demo
+./build/kvcache_demo            # 约 2 秒跑完、无停顿（ctest 跑的就是这个）
+./build/kvcache_demo --paced    # 每步停顿 + 配色，录制上面的 GIF 用
 ```
+
+`--paced` 只影响观感：每步后插入 `sleep`（默认 900ms，`--beat-ms=N` 可调）并给命中、引用计数变化、CoW 分裂上色；不带参数时输出同样的文本但没有停顿和转义序列，所以 CI 里的冒烟测试依然很快。
+
+重新录制 GIF：
+
+```bash
+# 一次性安装：winget install charmbracelet.vhs tsl0922.ttyd Gyan.FFmpeg.Essentials
+vhs docs/demo.tape              # 生成 docs/demo.gif
+```
+
+[docs/demo.tape](docs/demo.tape) 负责画布、主题和截帧节奏，`--paced` 负责每一步停留多久；画布按「全程不滚动」推算（13pt 下 76 行 × 88 列），改动 `Sleep` 时记得同步 `--beat-ms`。
 
 输出节选（A 段：同 prompt 的第二个请求直接复用物理块，fork 后尾块写入触发 CoW）：
 
 ```text
-[2] r2 prefill 同一 prompt: ok=1, 命中块=2, 空闲块=12
-    → 前 2 块直接复用 r1 的物理块（ref_count 变 2），只新分配 1 块
+[2] r2 prefill same prompt: ok=1, hit blocks=2, free=12
+    -> first 2 blocks reuse r1's blocks (ref 1 -> 2), only 1 block is new
 r2                 block_table=[0(ref=2) 1(ref=2) 3(ref=1)]
 
-[3] fork_sequence(r2) → ref_count 全部 +1，空闲块仍为 12
+[3] fork_sequence(r2) -> ref_count +1 for every block, free still 12
 son                block_table=[0(ref=3) 1(ref=3) 3(ref=2)]
 
-[4] son decode 一个 token（尾块 ref_count>1 → CoW）
-    尾块 3 → 4，slot=72，空闲块=11
+[4] son decodes one token (tail block ref_count>1 -> CoW)
+    BLK #3 (ref=2) splits -> BLK #4 (ref=1); #3 stays shared by r2 (ref=1)
+    tail 3 -> 4, slot=72, free=11
 ```
 
 逐个运行测试可看到每个用例的通过情况：
@@ -183,7 +198,9 @@ KV_Cache/
 ├── docs/
 │   ├── ARCHITECTURE.md    # 分层、数据结构、四阶段调度、锁纪律、不变量
 │   ├── VLLM_MAPPING.md    # 本项目符号 ↔ vLLM 源码位置的逐条对照
-│   └── DEVLOG.md          # 开发日志：每天的目标、踩坑与遗留项
+│   ├── DEVLOG.md          # 开发日志：每天的目标、踩坑与遗留项
+│   ├── demo.gif           # 录制好的演示，嵌在上面的「运行 demo」里
+│   └── demo.tape          # 生成 demo.gif 的 VHS 脚本
 ├── .clang-format          # 与现有代码风格对齐的格式化配置
 ├── .github/workflows/ci.yml
 └── CMakeLists.txt

@@ -14,3 +14,4 @@ CMakeLists.txt text eol=lf
 *.pdb      binary
 *.ilk      binary
 *.lib      binary
+*.gif      binary

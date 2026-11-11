@@ -5,7 +5,8 @@
 //   C. 空间不足时的抢占与重算：小池 + 长请求，观察 preemptions 与最终输出
 //
 // 构建：cmake --build build --target kvcache_demo
-// 运行：./build/kvcache_demo
+// 运行：./build/kvcache_demo           （ctest 用的就是这条：无停顿、无转义序列）
+//       ./build/kvcache_demo --paced   （录制 GIF 用：每步停顿 + 配色）
 
 #include "kvcache.h"
 
@@ -13,6 +14,8 @@
 #include <climits>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <future>
 #include <map>
 #include <memory>
@@ -20,7 +23,57 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX // windows.h 的 max() 宏会破坏 std::max
+#include <windows.h>
+#endif
+
 using namespace std::chrono;
+
+// ---------- 讲解节奏（只在 --paced 时生效） ----------
+// ctest 里跑的 kvcache_demo 不带参数：零停顿、无转义序列，输出与默认行为一致
+namespace
+{
+constexpr const char* C_RESET = "\033[0m";
+constexpr const char* C_TITLE = "\033[1;36m"; // 粗体青色：章节标题
+constexpr const char* C_OK = "\033[32m";      // 绿色：命中 / 复用
+constexpr const char* C_REF = "\033[33m";     // 黄色：引用计数变化
+constexpr const char* C_HOT = "\033[1;31m";   // 红色：CoW 分裂
+
+bool g_paced = false;
+int g_beat_ms = 900; // 每个节拍的默认停顿，可用 --beat-ms=N 调整
+
+const char* tint(const char* code)
+{
+    return g_paced ? code : "";
+}
+
+// Windows 10+ 的控制台默认不解析 ANSI，需要显式打开 VT 处理
+void enable_ansi()
+{
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if(h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode))
+        SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
+}
+
+// 停顿一拍，让录屏（VHS）有机会截到这一屏
+void beat(int ms = 0)
+{
+    if(!g_paced) return;
+    fflush(stdout);
+    std::this_thread::sleep_for(milliseconds(ms > 0 ? ms : g_beat_ms));
+}
+
+void section(const char* title)
+{
+    printf("\n%s=== %s ===%s\n", tint(C_TITLE), title, tint(C_RESET));
+    beat();
+}
+} // namespace
 
 // ---------- 小工具 ----------
 
@@ -54,7 +107,12 @@ static void print_blocks(const char* tag, const Request& r, BlockAllocator& allo
 {
     printf("  %-18s block_table=[", tag);
     for(size_t i = 0; i < r.block_table.size(); ++i)
-        printf("%s%d(ref=%d)", i ? " " : "", r.block_table[i], alloc.ref_count_of(r.block_table[i]));
+    {
+        const int ref = alloc.ref_count_of(r.block_table[i]);
+        // 共享块（ref>1）用黄色标出，方便一眼看到复用发生在哪儿
+        printf("%s%s%d(ref=%d)%s", i ? " " : "", tint(ref > 1 ? C_REF : ""),
+               r.block_table[i], ref, tint(ref > 1 ? C_RESET : ""));
+    }
     printf("]\n");
 }
 
@@ -115,16 +173,17 @@ static void print_results(const char* tag,
                           const std::vector<std::shared_ptr<Request>>& reqs,
                           const std::shared_ptr<Trace>& trace)
 {
-    printf("  %s：\n", tag);
+    printf("  %s:\n", tag);
     printf("    %-5s %-8s %-8s %-10s %-11s %s\n",
            "req", "prompt", "max_new", "generated", "cached_blk", "state");
     for(size_t i = 0; i < reqs.size(); ++i)
     {
         auto it = trace->hits.find(reqs[i].get());
         int cached = (it == trace->hits.end()) ? 0 : it->second;
-        printf("    #%-4zu %-8d %-8d %-10d %-11d %s\n",
+        const char* ok = tint(cached > 0 ? C_OK : "");
+        printf("    #%-4zu %-8d %-8d %-10d %s%-11d%s %s\n",
                i, specs[i].prompt_len, specs[i].max_new,
-               reqs[i]->num_generated_tokens, cached,
+               reqs[i]->num_generated_tokens, ok, cached, tint(cached > 0 ? C_RESET : ""),
                state_name(reqs[i]->s));
     }
 }
@@ -134,8 +193,8 @@ static void print_results(const char* tag,
 // ============================================================
 static void demo_prefix_and_cow()
 {
-    printf("\n=== A. 前缀命中与写时复制 ===\n");
-    printf("  BLOCK_SIZE=%d，16 个物理块\n", BLOCK_SIZE);
+    section("A. Prefix reuse and copy-on-write");
+    printf("  BLOCK_SIZE=%d, 16 physical blocks\n", BLOCK_SIZE);
 
     BlockAllocator alloc(16);
     BlockManager mgr(&alloc);
@@ -146,40 +205,50 @@ static void demo_prefix_and_cow()
 
     Request r1;
     bool ok = prefill(prompt, r1, mgr);
-    printf("\n  [1] r1 prefill(%d tokens): ok=%d, 登记满块=%d, 空闲块=%d\n",
+    printf("\n  [1] r1 prefill(%d tokens): ok=%d, registered full blocks=%d, free=%d\n",
            static_cast<int>(prompt.size()), ok, r1.num_cached_blocks, alloc.num_free_blocks());
     print_blocks("r1", r1, alloc);
+    beat();
 
     Request r2;
     ok = prefill(prompt, r2, mgr);
-    printf("\n  [2] r2 prefill 同一 prompt: ok=%d, 命中块=%d, 空闲块=%d\n",
+    printf("\n  [2] r2 prefill same prompt: ok=%d, hit blocks=%d, free=%d\n",
            ok, r2.num_cached_blocks, alloc.num_free_blocks());
-    printf("      → 前 %d 块直接复用 r1 的物理块（ref_count 变 2），只新分配 1 块\n",
-           r2.num_cached_blocks);
+    printf("      %s-> first %d blocks reuse r1's blocks (ref 1 -> 2), only 1 block is new%s\n",
+           tint(C_OK), r2.num_cached_blocks, tint(C_RESET));
     print_blocks("r2", r2, alloc);
+    beat();
 
     // fork：共享父请求的全部块（对应 beam search / 并行采样）
     Request son = fork_sequence(r2, alloc);
-    printf("\n  [3] fork_sequence(r2) → ref_count 全部 +1，空闲块仍为 %d\n",
+    printf("\n  [3] fork_sequence(r2) -> ref_count +1 for every block, free still %d\n",
            alloc.num_free_blocks());
     print_blocks("son", son, alloc);
+    beat();
 
     // 尾块被两条序列共享，此时写入必须触发 CoW
     int tail_before = son.block_table.back();
+    int tail_ref_before = alloc.ref_count_of(tail_before);
     int slot = append_slot(mgr, son);
     append_token(mgr, son, 7);
-    printf("\n  [4] son decode 一个 token（尾块 ref_count>1 → CoW）\n");
-    printf("      尾块 %d → %d，slot=%d，空闲块=%d\n",
+    printf("\n  [4] son decodes one token (tail block ref_count>1 -> CoW)\n");
+    printf("      %sBLK #%d (ref=%d) splits -> BLK #%d (ref=%d); #%d stays shared by r2 (ref=%d)%s\n",
+           tint(C_HOT), tail_before, tail_ref_before, son.block_table.back(),
+           alloc.ref_count_of(son.block_table.back()), tail_before,
+           alloc.ref_count_of(tail_before), tint(C_RESET));
+    printf("      tail %d -> %d, slot=%d, free=%d\n",
            tail_before, son.block_table.back(), slot, alloc.num_free_blocks());
     print_blocks("son", son, alloc);
-    print_blocks("r2（未受影响）", r2, alloc);
+    print_blocks("r2 (untouched)", r2, alloc);
+    beat(1500);
 
     // 引用计数归零才真正回收到空闲链表
     mgr.release(son);
     mgr.release(r2);
     mgr.release(r1);
-    printf("\n  [5] 全部释放后：空闲块 = %d/%d\n",
+    printf("\n  [5] all requests released: free = %d/%d\n",
            alloc.num_free_blocks(), alloc.num_blocks());
+    beat();
 }
 
 // ============================================================
@@ -187,7 +256,7 @@ static void demo_prefix_and_cow()
 // ============================================================
 static void demo_prefix_cache_waves()
 {
-    printf("\n=== B. 前缀缓存跨批次复用 ===\n");
+    section("B. Cross-batch prefix cache reuse");
 
     BlockAllocator alloc(32);
     BlockManager mgr(&alloc);
@@ -197,12 +266,12 @@ static void demo_prefix_cache_waves()
     // 48 token = 3 个满块，正好全部可被前缀缓存登记
     auto common = make_tokens(2000, 48);
 
-    printf("  公共前缀：%d tokens（= %d 个满块）\n",
+    printf("  common prefix: %d tokens (= %d full blocks)\n",
            static_cast<int>(common.size()), static_cast<int>(common.size()) / BLOCK_SIZE);
 
     // ---- 第一波：3 个完全相同 prompt 的请求同一步准入 ----
     // 第一个请求登记 3 个满块，同一步内后两个请求立刻命中
-    printf("\n  [第一波] 3 个请求 prompt 均为 48 tokens（完全相同）\n");
+    printf("\n  [wave 1] 3 requests, all with the identical 48-token prompt\n");
     // 回调必须在 start() 之前设置（运行中替换 std::function 会与 Worker 竞争）
     auto trace = attach_trace(sched, alloc);
 
@@ -221,16 +290,18 @@ static void demo_prefix_cache_waves()
     sched.start();
     for(auto& f : futures1)
         f.wait();
-    print_results("第一波结果（cached_blk=3 是 3 个满块；#1/#2 命中的是 #0 刚登记的块）",
+    print_results("wave 1 (cached_blk=3 means 3 full blocks; #1/#2 hit blocks #0 just registered)",
                   specs1, reqs1, trace);
-    printf("    峰值占用 %d 块 = 3 个共享前缀块 + 3 个各自 decode 块（不共享则需 12 块）\n",
+    printf("    peak usage %d blocks = 3 shared prefix + 3 private decode (12 without sharing)\n",
            alloc.num_blocks() - trace->min_free);
-    printf("    空闲块=%d/%d（请求已结束：引用归零，块回到空闲链表）\n",
+    printf("    free=%d/%d (all finished: refs hit zero, blocks are back on the free list)\n",
            alloc.num_free_blocks(), alloc.num_blocks());
+    beat();
 
     // ---- 第二波：共享同一前缀，尾部各自不同 ----
     // 第一波已结束，但满块的哈希仍登记在 hash_to_block_ 中 → 仍可命中
-    printf("\n  [第二波] 3 个请求 prompt = 48 公共前缀 + 16 各自私有（共 4 块）\n");
+    printf("\n  [wave 2] 3 requests: 48-token common prefix + 16 private tokens (4 blocks each)\n");
+    beat(600);
 
     // 跨波的 happens-before 由 future 保证：scheduler 线程不会再动这些字段
     trace->min_free = INT_MAX;
@@ -250,7 +321,7 @@ static void demo_prefix_cache_waves()
         // 预查必须放在所有 add_request() 之前：BlockManager 只由调度线程改，
         // 一旦有请求入队，调度线程就可能 prefill 并写哈希表，主线程再查就是数据竞争
         auto preview = mgr.match_prefix(p);
-        printf("    req#%d 提交前预查：命中 %d 块 / 共需 %d 块\n", i,
+        printf("    req#%d pre-check before submit: %d of %d blocks already cached\n", i,
                static_cast<int>(preview.cached_blocks.size()),
                static_cast<int>((p.size() + BLOCK_SIZE - 1) / BLOCK_SIZE));
 
@@ -266,13 +337,14 @@ static void demo_prefix_cache_waves()
     for(auto& f : futures2)
         f.wait();
     sched.stop(true);
-    print_results("第二波结果（提交前预查已命中 3 块；cached_blk 还含自己登记的第 4 块）",
+    print_results("wave 2 (pre-check already hit 3 blocks; cached_blk also counts the 4th)",
                   specs2, reqs2, trace);
-    printf("    峰值占用 %d 块（若不共享前缀，同一时刻 3 个请求各需 4 块 = 12 块）\n",
+    printf("    peak usage %d blocks (without sharing, 3 concurrent requests need 4 each = 12)\n",
            alloc.num_blocks() - trace->min_free);
-    printf("    总步数=%lld，抢占次数=%d，剩余空闲块=%d/%d\n",
+    printf("    steps=%lld, preemptions=%d, free=%d/%d\n",
            sched.num_steps(), sched.num_preemptions(),
            alloc.num_free_blocks(), alloc.num_blocks());
+    beat();
 }
 
 // ============================================================
@@ -282,8 +354,8 @@ static void demo_preemption()
 {
     constexpr int kBlocks = 16;
 
-    printf("\n=== C. 空间不足时的抢占与重算 ===\n");
-    printf("  %d 个物理块（可用 %d）\n", kBlocks, kBlocks - WATER_MARK);
+    section("C. Preemption and recompute");
+    printf("  %d physical blocks (%d usable)\n", kBlocks, kBlocks - WATER_MARK);
 
     BlockAllocator alloc(kBlocks);
     BlockManager mgr(&alloc);
@@ -297,7 +369,7 @@ static void demo_preemption()
     std::vector<std::shared_ptr<Request>> reqs;
     std::vector<std::future<void>> futures;
 
-    printf("  提交 %d 个请求：prompt=32 tokens, max_new=56（每个最终需 6 块）\n", kNumReq);
+    printf("  submit %d requests: prompt=32 tokens, max_new=56 (6 blocks each at the end)\n", kNumReq);
     for(int i = 0; i < kNumReq; ++i)
     {
         auto p = make_tokens(4000 + i * 700, 32);
@@ -314,20 +386,62 @@ static void demo_preemption()
         f.wait();
     sched.stop(true);
 
-    print_results("结果（抢占不丢输出，靠重算恢复）", specs, reqs, trace);
-    printf("    总步数=%lld，抢占次数=%d，剩余空闲块=%d/%d\n",
+    print_results("results (no output lost across preemption; recovered by recompute)", specs, reqs, trace);
+    printf("    steps=%lld, preemptions=%d, free=%d/%d\n",
            sched.num_steps(), sched.num_preemptions(),
            alloc.num_free_blocks(), alloc.num_blocks());
-    printf("    抢占语义：释放 victim 的块 → 标记 WAITING → 放回等待队列队首；\n");
-    printf("              恢复时对 all_tokens（prompt + 已生成 token）重新 prefill，即「重算」\n");
+    printf("    preemption: free the victim's blocks -> mark it WAITING -> push to the queue front;\n");
+    printf("                on resume, prefill all_tokens (prompt + generated) again, i.e. recompute\n");
+    beat();
 }
 
-int main()
+static void usage(const char* argv0)
 {
-    printf("mini KV Cache demo — 复现 vLLM 的分页 KV Cache 与调度\n");
+    printf("usage: %s [options]\n", argv0);
+    printf("  --paced        pause after each step and colorize the output (for GIF recording; off by default)\n");
+    printf("  --beat-ms=N    milliseconds per beat (default 900, minimum 100)\n");
+    printf("  -h, --help     show this help\n");
+}
+
+int main(int argc, char** argv)
+{
+#ifdef _WIN32
+    // Windows 控制台默认按本地代码页（如 GBK）解码，统一切到 UTF-8 避免非 ASCII 字符乱码
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+
+    for(int i = 1; i < argc; ++i)
+    {
+        if(std::strcmp(argv[i], "--paced") == 0)
+        {
+            g_paced = true;
+            enable_ansi();
+        }
+        else if(std::strncmp(argv[i], "--beat-ms=", 10) == 0)
+        {
+            g_beat_ms = std::max(100, std::atoi(argv[i] + 10));
+        }
+        else if(std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
+        {
+            usage(argv[0]);
+            return 0;
+        }
+        else
+        {
+            printf("unknown argument: %s\n", argv[i]);
+            usage(argv[0]);
+            return 2;
+        }
+    }
+
+    printf("%smini KV Cache demo%s - reproducing vLLM's paged KV cache and scheduler\n",
+           tint(C_TITLE), tint(C_RESET));
+    beat();
     demo_prefix_and_cow();
     demo_prefix_cache_waves();
     demo_preemption();
-    printf("\n完成。机制细节见 docs/ARCHITECTURE.md，与 vLLM 的对照见 docs/VLLM_MAPPING.md\n");
+    printf("\n%sdone%s. Mechanics: docs/ARCHITECTURE.md | vLLM comparison: docs/VLLM_MAPPING.md\n",
+           tint(C_OK), tint(C_RESET));
+    beat(1200);
     return 0;
 }

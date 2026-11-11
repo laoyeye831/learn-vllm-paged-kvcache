@@ -116,30 +116,48 @@ ctest --test-dir build-tsan --output-on-failure
 
 ### Run the demo
 
+![KV cache demo](docs/demo.gif)
+
 ```bash
-./build/kvcache_demo
+./build/kvcache_demo            # 2-second run, no pauses (this is what ctest executes)
+./build/kvcache_demo --paced    # narrated pacing + colors, used to record the GIF
 ```
 
-The demo runs three scenarios: prefix reuse with copy-on-write, cross-batch prefix-cache hits, and preemption with recompute. It prints in Chinese; here is the key result from the cross-batch scenario, translated:
+`--paced` is purely presentational: it inserts a `sleep` after each step (default 900 ms, `--beat-ms=N` to change) and colorizes hits, ref-count changes and copy-on-write splits. Without the flag the same text is printed with no pauses and no escape sequences, so the demo still finishes in ~2 s and the CI test stays fast.
+
+To re-record the GIF:
+
+```bash
+# one-time: winget install charmbracelet.vhs tsl0922.ttyd Gyan.FFmpeg.Essentials
+vhs docs/demo.tape              # writes docs/demo.gif
+```
+
+The tape ([docs/demo.tape](docs/demo.tape)) controls the canvas, theme and capture pacing; `--paced` controls how long each step stays on screen. The canvas is sized so the whole run fits without scrolling (76 lines × 88 columns at 13 pt). Tune `--beat-ms` if you change the tape's `Sleep`.
+
+The demo runs three scenarios: prefix reuse with copy-on-write, cross-batch prefix-cache hits, and preemption with recompute. Key output from the cross-batch scenario:
 
 ```text
-Input : 3 requests, all sharing the same 48-token prompt (3 full blocks)
-Pool  : 32 blocks
+common prefix: 48 tokens (= 3 full blocks)
 
-Peak blocks in use : 6   (3 shared prefix blocks + 3 private decode blocks)
-Without prefix reuse : 12
-Preemptions          : 0
+[wave 1] 3 requests, all with the identical 48-token prompt
+  peak usage 6 blocks = 3 shared prefix + 3 private decode (12 without sharing)
+  free=32/32 (all finished: refs hit zero, blocks are back on the free list)
+
+[wave 2] 3 requests: 48-token common prefix + 16 private tokens (4 blocks each)
+  req#0 pre-check before submit: 3 of 4 blocks already cached
+  peak usage 9 blocks (without sharing, 3 concurrent requests need 4 each = 12)
+  steps=6, preemptions=0, free=32/32
 ```
 
 And from the copy-on-write scenario, the reference count of a shared block across the whole flow:
 
 ```text
-prefill(r1)        block 0 ref_count = 1     # allocated
-prefill(r2)        block 0 ref_count = 2     # prefix hit, reused
-fork_sequence(r2)  block 0 ref_count = 3     # forked
-decode(son)        block 0 ref_count = 3     # read-only, no copy
-                   tail block splits        # ref_count was 2 -> copy-on-write
-after release(all) blocks free = 16/16
+prefill(r1)        BLK #0 ref=1     # allocated
+prefill(r2)        BLK #0 ref=2     # prefix hit, reused
+fork_sequence(r2)  BLK #0 ref=3     # forked
+decode(son)        BLK #0 ref=3     # read-only, no copy
+                   BLK #3 (ref=2) splits -> BLK #4 (ref=1)
+after release(all) free = 16/16
 ```
 
 ## Tests
@@ -179,7 +197,9 @@ KV_Cache/
 ├── docs/
 │   ├── ARCHITECTURE.md    # Layers, data structures, four-phase scheduling, locking rules, invariants (Chinese)
 │   ├── VLLM_MAPPING.md    # Symbol-by-symbol mapping from this project to vLLM's source (Chinese)
-│   └── DEVLOG.md          # Development log: daily goals, dead ends, leftovers (Chinese)
+│   ├── DEVLOG.md          # Development log: daily goals, dead ends, leftovers (Chinese)
+│   ├── demo.gif           # Recorded demo, embedded above
+│   └── demo.tape          # VHS script that produces demo.gif
 ├── .clang-format
 ├── .github/workflows/ci.yml
 └── CMakeLists.txt
