@@ -1,4 +1,4 @@
-﻿#include "test_util.h"
+#include "test_util.h"
 #include <memory>
 
 // =========================================================
@@ -284,6 +284,52 @@ void test_sched_preempted_request_resumes_first()
     EXPECT_EQ(alloc.num_free_blocks(), 10);
 }
 
+void test_sched_custom_block_size_and_watermark()
+{
+    // block_size=8，16 个块，watermark_blocks=2 → 可用 14 块
+    BlockAllocator alloc(16, 8);
+    BlockManager mgr(&alloc);
+    SchedulerConfig cfg;
+    cfg.watermark_blocks = 2;
+    Scheduler sched(mgr, cfg);
+    sched.set_sampler(fake_sample);
+    sched.set_step_hook([&](const Scheduler& s)
+                        { check_invariants(s, alloc); });
+    EXPECT_EQ(sched.watermark_blocks(), 2);
+
+    auto r1 = make_request(12, 1000, 20); // 32 token -> 4 块
+    auto r2 = make_request(12, 2000, 20); // 32 token -> 4 块
+    sched.add_request(r1);
+    sched.add_request(r2);
+
+    EXPECT_TRUE(run_until_done(sched) > 0);
+    EXPECT_TRUE(r1->s == ReqState::FINISHED);
+    EXPECT_TRUE(r2->s == ReqState::FINISHED);
+    EXPECT_EQ(alloc.num_free_blocks(), 16);
+}
+
+void test_sched_watermark_ratio_aborts_oversized()
+{
+    // 16 块，watermark_ratio=0.25 → watermark=4，最大单请求 12 块（192 token）
+    BlockAllocator alloc(16, 16);
+    BlockManager mgr(&alloc);
+    SchedulerConfig cfg;
+    cfg.watermark_ratio = 0.25;
+    Scheduler sched(mgr, cfg);
+    sched.set_sampler(fake_sample);
+    EXPECT_EQ(sched.watermark_blocks(), 4);
+
+    auto too_big = make_request(16, 1000, 180); // 196 token -> 13 块 > 12 → ABORTED
+    auto ok_req = make_request(16, 2000, 16);   // 32 token -> 2 块 <= 12 → FINISHED
+    sched.add_request(too_big);
+    sched.add_request(ok_req);
+
+    EXPECT_TRUE(run_until_done(sched) > 0);
+    EXPECT_TRUE(too_big->s == ReqState::ABORTED);
+    EXPECT_TRUE(ok_req->s == ReqState::FINISHED);
+    EXPECT_EQ(alloc.num_free_blocks(), 16);
+}
+
 int main()
 {
     std::cout << "========== 阶段四：Scheduler（Recompute 抢占与接纳） ==========\n";
@@ -298,6 +344,8 @@ int main()
     RUN_TEST(test_sched_preemption_preserves_output);
     RUN_TEST(test_sched_preemption_with_shared_prefix);
     RUN_TEST(test_sched_preempted_request_resumes_first);
+    RUN_TEST(test_sched_custom_block_size_and_watermark);
+    RUN_TEST(test_sched_watermark_ratio_aborts_oversized);
 
     if(g_fail_count == 0)
     {

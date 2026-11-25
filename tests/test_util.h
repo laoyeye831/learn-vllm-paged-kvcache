@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "kvcache.h"
 #include <iostream>
 #include <sstream>
@@ -151,9 +151,10 @@ inline void check_invariants(const Scheduler& sched, const BlockAllocator& alloc
     CHECK(zero_count == allocator.num_free_blocks());
 
     // 4) RUNNING 请求的 block_table 长度
+    const int blk_size = allocator.block_size();
     for(const auto& r : sched.running())
     {
-        int expected_blocks = (r->sequence_length + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        int expected_blocks = (r->sequence_length + blk_size - 1) / blk_size;
         if(static_cast<int>(r->block_table.size()) != expected_blocks)
         {
             fprintf(stderr,

@@ -229,12 +229,10 @@ clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
 
 这是学习项目，以下部分是**刻意简化**的，不是待修复的 bug：
 
-- **没有真实 KV 数据**：`append_slot()` 的 CoW 分支只打印 `copy valid tokens to new block`，不搬运 tensor；每个块只记录元信息。
+- **没有真实 KV 数据**：`append_slot()` 的 CoW 分支仅通过 `BlockManager::num_cow_copies()` 计数，不搬运 tensor；每个块只记录元信息。
 - **没有 LRU 淘汰**：`PhysicalBlock::last_accessed` 目前未被使用，`free_list_` 是 FIFO。块回收后其哈希条目靠 `has_hash` / `hash` 校验失效，不做主动驱逐。
 - **没有 swap 到 CPU**：抢占走「释放 + 重算」路径（要求 `all_tokens.size() == sequence_length`，即 prompt 可重放），不实现 Swapped 状态。
-- **Worker 静态分片**：批次按 `n / num_workers` 均分，长任务会导致其他 Worker 空等；动态分发（共享原子游标）尚未实现。
 - **采样器是占位实现**：`fake_sample()` 是一个确定性哈希函数，用于让结果可对拍，不涉及任何模型。
-- **参数硬编码**：`BLOCK_SIZE = 16`、`WATER_MARK = 4` 为编译期常量，没有配置文件。
 - **哈希无碰撞兜底**：链式多项式哈希 64 位，理论碰撞概率极低但未做额外校验。
 
 ## Roadmap
@@ -243,11 +241,12 @@ clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
 - [x] `docs/ARCHITECTURE.md` / `docs/VLLM_MAPPING.md` / `docs/DEVLOG.md`
 - [x] GitHub Actions CI（Linux/GCC + Windows/MSVC + ThreadSanitizer + clang-format）
 - [x] 源码整理为 `include/` + `src/` 布局，统一 clang-format 风格
-- [ ] Worker 池改为动态分发（共享原子游标），消除长尾空等
-- [ ] 引入 LRU 空闲块淘汰，替换 FIFO 空闲链表
-- [ ] 把 `BLOCK_SIZE` / `WATER_MARK` 改为运行期可配置
-- [ ] 补充 GPU ↔ CPU swap 语义（当前 `ReqState::SWAPPED` 未被使用）
+- [x] Worker 池改为动态分发（共享原子游标），消除长尾空等
+- [x] 把 `block_size` / `watermark`（含比例模式）/ `enable_prefix_caching` 改为运行期可配置
+- [x] 前缀哈希零拷贝 + `register_block` $O(1)$ 增量计算，补齐队列并发观察锁保护
+- [ ] 引入 $O(1)$ LRU 空闲块淘汰，替换 FIFO 空闲链表
 - [ ] 统计缓存命中率与块利用率，输出为可对比的指标表
+- [ ] 探索 Chunked Prefill / Token Budget（或 GPU ↔ CPU swap 对比）
 
 ## 声明
 

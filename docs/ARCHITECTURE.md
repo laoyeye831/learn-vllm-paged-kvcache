@@ -188,7 +188,7 @@ flowchart LR
 
 ### 三条铁律
 
-1. **多把锁的获取顺序固定**：`sched_mutex_` → `pending_mutex_` → `waiting_mutex_` / `running_mutex_`，任何地方都不反向。
+1. **多把锁的获取顺序固定**：`sched_mutex_` → `pending_mutex_` → `running_mutex_` → `waiting_mutex_` → `alloc_mutex_`，任何地方都不反向（包括 `step()` 阶段二/三与 `abort_all_pending()`）。
 2. **promise 只在锁外 `set_value()`**：被唤醒的调用方可能立刻回头调 `add_request()`，若在锁内兑现就会自己堵自己（Day 6 的踩坑记录）。
 3. **运行中不可替换回调**：`set_sampler()` / `set_step_hook()` 用 `assert(!started_)` 拦住，因为 Worker 会并发只读这两个 `std::function`。
 
@@ -200,18 +200,18 @@ sequenceDiagram
     participant P as pool_mutex_
     participant W as Worker[i]
 
-    M->>P: 切分 cur_begin_/cur_end_，remaining_ = N，++round_
+    M->>P: 重置 next_task_idx_ = 0，remaining_ = N，++round_
     M->>W: task_cv_.notify_all()
     W->>P: wait(round_ != seen)
-    W->>W: 锁外计算 out[i] = sample(batch[i])
+    W->>W: 锁外 fetch_add(next_task_idx_) 动态抢任务并计算 out[i]
     W->>P: --remaining_，为 0 时 done_cv_.notify_one()
     M->>P: done_cv_.wait(remaining_ == 0)
     Note over M: 检查 worker_error_，有异常则在此重抛
 ```
 
-- **静态分片**：`n / num_workers` 加余数分摊，长任务会造成其他 Worker 空等（已知限制，Roadmap 里要换原子游标）。
-- **空批次不翻牌**：`batch.empty()` 直接返回，否则 `remaining_` 与唤醒次数对不上会死锁。
-- **空区间也会减 `remaining_`**：请求数少于 Worker 数时，分到空区间的 Worker 照样「收工」，这是 `test_pool_more_workers_than_requests` 覆盖的场景。
+- **动态分发（原子游标）**：每个 Worker 在锁外通过 `next_task_idx_.fetch_add(1)` 抢下一个任务下标，遇到长尾慢请求时其余 Worker 可继续消化剩余任务，不再空等。
+- **单请求短路 & 空批次不翻牌**：`batch.empty()` 直接返回；`batch.size() == 1` 直接在调度线程串行采样，省去无意义的线程唤醒开销。
+- **多余 Worker 也会减 `remaining_`**：请求数少于 Worker 数时，没抢到任务的 Worker 立即退出循环并「收工」，这是 `test_pool_more_workers_than_requests` 覆盖的场景。
 - **异常跨线程传播**：Worker 里的异常存进 `worker_error_`，由调度线程在主线程栈上 `rethrow`，不会静默丢失。
 
 ## 6. 不变量
@@ -246,10 +246,8 @@ stateDiagram-v2
 
 | 简化 | 影响 |
 |---|---|
-| KV 内容是整数模拟，CoW 只打印不搬运 | 无法测量真实拷贝开销 |
+| KV 内容是整数模拟，CoW 仅计数不搬运 | 无法测量真实拷贝开销 |
 | 空闲链表是 FIFO，`last_accessed` 未使用 | 没有 LRU 淘汰，块回收后靠 `has_hash` 校验失效 |
 | 抢占只做「释放 + 重算」，无 `SWAPPED` | `ReqState::SWAPPED` 目前是死枚举 |
-| `BLOCK_SIZE` / `WATER_MARK` 编译期常量 | 无法做参数扫描对比实验 |
-| Worker 静态分片 | 长尾任务浪费核心 |
 
 完整清单见 README 的「已知限制」一节。

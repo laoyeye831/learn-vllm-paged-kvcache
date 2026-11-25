@@ -1,4 +1,4 @@
-﻿#include "test_util.h"
+#include "test_util.h"
 
 #include <chrono>
 #include <memory>
@@ -340,6 +340,89 @@ void test_pool_stop_without_drain()
     EXPECT_EQ(alloc.num_free_blocks(), 32);
 }
 
+// 动态分发验证：批次内存在长尾慢请求时，其他 Worker 应继续领取剩余快任务而非空等
+void test_pool_dynamic_dispatch_handles_straggler()
+{
+    BlockAllocator alloc(64);
+    BlockManager mgr(&alloc);
+    Scheduler sched(mgr, 4);
+
+    // arrival_id == 0 为慢请求（12ms），其余 7 个为快请求（1ms）
+    // 静态分片下，与慢请求同组的快请求必须等慢请求结束；动态分发下由其他 3 个 Worker 立即消化
+    sched.set_sampler([](const Request& r)
+                      {
+        if(r.arrival_id == 0)
+            std::this_thread::sleep_for(milliseconds(12));
+        else
+            std::this_thread::sleep_for(milliseconds(1));
+        return fake_sample(r); });
+    sched.start();
+
+    std::vector<std::shared_ptr<Request>> reqs;
+    std::vector<std::future<void>> futures;
+    for(int i = 0; i < 8; ++i)
+    {
+        auto r = make_req(16, 6000 + i * 100, 5);
+        reqs.push_back(r);
+        futures.push_back(sched.add_request(r));
+    }
+
+    bool ready = true;
+    for(auto& f : futures)
+        ready = wait_ready(f, milliseconds(5000)) && ready;
+    EXPECT_TRUE(ready);
+
+    for(auto& r : reqs)
+    {
+        EXPECT_TRUE(r->s == ReqState::FINISHED);
+        EXPECT_EQ(r->num_generated_tokens, 5);
+    }
+
+    sched.stop(true);
+    EXPECT_EQ(alloc.num_free_blocks(), 64);
+}
+
+// 并发观察者验证：调度线程在频繁抢占/准入期间，外部线程并发调用 running()/waiting() 不得出现数据竞争
+void test_concurrent_queue_observers_safe()
+{
+    BlockAllocator alloc(12);
+    BlockManager mgr(&alloc);
+    Scheduler sched(mgr, 2);
+    sched.set_sampler(fake_sample);
+    sched.start();
+
+    std::atomic<bool> done{false};
+    std::thread observer([&]
+                         {
+        while(!done.load())
+        {
+            auto r = sched.running();
+            auto w = sched.waiting();
+            (void)r;
+            (void)w;
+        } });
+
+    std::vector<std::future<void>> futures;
+    std::vector<std::shared_ptr<Request>> reqs;
+    for(int i = 0; i < 8; ++i)
+    {
+        auto r = make_req(16, 8000 + i * 100, 32);
+        reqs.push_back(r);
+        futures.push_back(sched.add_request(r));
+    }
+
+    bool ready = true;
+    for(auto& f : futures)
+        ready = wait_ready(f, milliseconds(10000)) && ready;
+    done.store(true);
+    observer.join();
+
+    EXPECT_TRUE(ready);
+    EXPECT_TRUE(sched.num_preemptions() > 0);
+    sched.stop(true);
+    EXPECT_EQ(alloc.num_free_blocks(), 12);
+}
+
 int main()
 {
     std::cout << "========== 阶段四：Scheduler 线程生命周期（M2） ==========\n";
@@ -355,6 +438,8 @@ int main()
     RUN_TEST(test_pool_speeds_up_with_delay);
     RUN_TEST(test_pool_more_workers_than_requests);
     RUN_TEST(test_pool_stop_without_drain);
+    RUN_TEST(test_pool_dynamic_dispatch_handles_straggler);
+    RUN_TEST(test_concurrent_queue_observers_safe);
 
     if(g_fail_count == 0)
     {

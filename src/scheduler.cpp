@@ -1,5 +1,6 @@
 #include "kvcache.h"
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <cassert>
@@ -8,7 +9,25 @@
 
 // ====== 调度策略 ======
 Scheduler::Scheduler(BlockManager& manager, int num_workers)
-    : manager_(manager), num_workers_(num_workers > 0 ? num_workers : 1) {}
+    : Scheduler(manager, SchedulerConfig{num_workers, DEFAULT_WATER_MARK, -1.0}) {}
+
+Scheduler::Scheduler(BlockManager& manager, SchedulerConfig config)
+    : manager_(manager), config_(config), num_workers_(config.num_workers > 0 ? config.num_workers : 1)
+{
+    config_.num_workers = num_workers_;
+    if(config_.watermark_blocks < 0) config_.watermark_blocks = 0;
+}
+
+int Scheduler::watermark_blocks() const
+{
+    const int total = manager_.get_allocator()->num_blocks();
+    if(config_.watermark_ratio >= 0.0)
+    {
+        int wm = static_cast<int>(std::ceil(static_cast<double>(total) * config_.watermark_ratio));
+        return std::max(0, std::min(wm, std::max(0, total - 1)));
+    }
+    return config_.watermark_blocks;
+}
 
 // 采样器在运行前设置好，取消加锁，防止死锁
 int Scheduler::run_sample(const Request& req)
@@ -79,7 +98,8 @@ std::future<void> Scheduler::add_request(std::shared_ptr<Request> req)
 // 判断请求是否能继续decode
 bool Scheduler::can_append(std::shared_ptr<Request> req)
 {
-    int offset = req->sequence_length % BLOCK_SIZE;
+    const int blk_size = manager_.block_size();
+    int offset = req->sequence_length % blk_size;
 
     // 是否需要分配新物理块（新增 / 写时复制）
     bool if_new;
@@ -102,7 +122,8 @@ bool Scheduler::can_append(std::shared_ptr<Request> req)
 
 int Scheduler::blocks_needed_for_prefill(std::shared_ptr<Request> req)
 {
-    int total = (req->all_tokens.size() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int blk_size = manager_.block_size();
+    int total = (static_cast<int>(req->all_tokens.size()) + blk_size - 1) / blk_size;
     auto match = manager_.match_prefix(req->all_tokens);
     auto allocator_ = manager_.get_allocator();
     int match_block_num{0};
@@ -134,13 +155,14 @@ void Scheduler::preempt()
 
 void Scheduler::worker_loop(int id)
 {
+    (void)id;
     uint64_t seen = 0; // 该 Worker 已完成到第几轮；局部变量，每个线程各一份
 
     while(true)
     {
         const std::vector<std::shared_ptr<Request>>* batch = nullptr;
         std::vector<int>* out = nullptr;
-        size_t begin = 0, end = 0;
+        size_t batch_size = 0;
 
         {
             std::unique_lock<std::mutex> lock(pool_mutex_);
@@ -150,13 +172,14 @@ void Scheduler::worker_loop(int id)
             seen = round_;
             batch = cur_batch_;
             out = cur_out_;
-            begin = cur_begin_[id];
-            end = cur_end_[id];
+            batch_size = cur_batch_size_;
         }
 
-        // 计算时不持锁，否则并行退化成串行
-        for(size_t i = begin; batch && out && i < end; ++i)
+        // 动态分发：共享原子游标按需领取任务，消除静态分片的长尾空等
+        while(batch && out)
         {
+            size_t i = next_task_idx_.fetch_add(1, std::memory_order_relaxed);
+            if(i >= batch_size) break;
             try
             {
                 (*out)[i] = run_sample(*(*batch)[i]);
@@ -180,12 +203,12 @@ void Scheduler::sample_batch_parallel(const std::vector<std::shared_ptr<Request>
     out.assign(batch.size(), 0);
     if(batch.empty()) return; // 空批次不翻牌，否则 remaining_ 与唤醒次数对不上
 
-    const int n = static_cast<int>(batch.size());
+    const size_t n = batch.size();
 
-    // 单 Worker 或池未启动：串行，行为与旧版完全一致
-    if(num_workers_ <= 1 || !pool_running_)
+    // 单 Worker、池未启动或单请求批次：直接串行，避免无意义的线程唤醒开销
+    if(num_workers_ <= 1 || !pool_running_ || n == 1)
     {
-        for(int i = 0; i < n; ++i)
+        for(size_t i = 0; i < n; ++i)
             out[i] = run_sample(*batch[i]);
         return;
     }
@@ -193,22 +216,11 @@ void Scheduler::sample_batch_parallel(const std::vector<std::shared_ptr<Request>
     std::unique_lock<std::mutex> lock(pool_mutex_);
     cur_batch_ = &batch;
     cur_out_ = &out;
-    cur_begin_.resize(num_workers_);
-    cur_end_.resize(num_workers_);
-
-    const int chunk = n / num_workers_;
-    const int extra = n % num_workers_;
-    size_t pos = 0;
-    for(int w = 0; w < num_workers_; ++w)
-    {
-        size_t len = static_cast<size_t>(chunk) + (w < extra ? 1 : 0);
-        cur_begin_[w] = pos;
-        pos += len;
-        cur_end_[w] = pos;
-    }
+    cur_batch_size_ = n;
+    next_task_idx_.store(0, std::memory_order_relaxed);
 
     worker_error_ = nullptr;
-    remaining_ = num_workers_; // 必须在 notify 之前设好；空区间的 Worker 也会减
+    remaining_ = num_workers_; // 必须在 notify 之前设好；没领到任务的 Worker 也会减
     ++round_;                  // 翻牌
     task_cv_.notify_all();
     done_cv_.wait(lock, [&]
@@ -216,6 +228,7 @@ void Scheduler::sample_batch_parallel(const std::vector<std::shared_ptr<Request>
 
     cur_batch_ = nullptr;
     cur_out_ = nullptr;
+    cur_batch_size_ = 0;
 
     if(worker_error_)
     {
@@ -229,7 +242,9 @@ void Scheduler::step()
     std::lock_guard<std::mutex> step_lock(step_mutex_); // 同一时刻只允许一个线程推进调度
 
     BlockAllocator* allocator = manager_.get_allocator();
-    int num_blocks = allocator->num_blocks();
+    const int num_blocks = allocator->num_blocks();
+    const int blk_size = manager_.block_size();
+    const int watermark = watermark_blocks();
 
     // 阶段一：先清空收件箱进入waiting_queue
     // 本步内完成的 promise 统一收集，等到 step() 末尾（step_hook_ 之后）再唤醒，
@@ -242,9 +257,9 @@ void Scheduler::step()
         while(!inbox_.empty())
         {
             auto temp = inbox_.begin();
-            int N = (*temp)->all_tokens.size();
+            int N = static_cast<int>((*temp)->all_tokens.size());
             int max_ = (*temp)->max_new_tokens;
-            if((N + max_ + BLOCK_SIZE - 1) / BLOCK_SIZE > num_blocks - WATER_MARK)
+            if((N + max_ + blk_size - 1) / blk_size > num_blocks - watermark)
             {
                 int id = (*temp)->arrival_id;
                 (*temp)->s = ReqState::ABORTED;
@@ -258,22 +273,25 @@ void Scheduler::step()
             inbox_.erase(temp);
         }
     }
-    // 阶段二：挨个看看是否该抢占
+    // 阶段二：挨个看看是否该抢占（固定锁顺序：running_mutex_ -> waiting_mutex_）
     bool preempted = false;
     std::vector<std::shared_ptr<Request>> batch; // 本step能执行的请求
-
-    for(size_t i = 0; i < running_queue_.size(); ++i)
     {
-        while(!can_append(running_queue_[i]))
+        std::unique_lock<std::mutex> lock_r(running_mutex_);
+        std::unique_lock<std::mutex> lock_w(waiting_mutex_);
+        for(size_t i = 0; i < running_queue_.size(); ++i)
         {
-            preempt();
-            preempted = true;
-            if(i >= running_queue_.size()) break; // 抢占自己不行
-        }
-        if(i < running_queue_.size())
-        {
-            append_slot(manager_, *running_queue_[i]);
-            batch.push_back(running_queue_[i]);
+            while(!can_append(running_queue_[i]))
+            {
+                preempt();
+                preempted = true;
+                if(i >= running_queue_.size()) break; // 抢占自己不行
+            }
+            if(i < running_queue_.size())
+            {
+                append_slot(manager_, *running_queue_[i]);
+                batch.push_back(running_queue_[i]);
+            }
         }
     }
 
@@ -281,15 +299,16 @@ void Scheduler::step()
     if(!preempted)
     {
         // 没发生抢占，说明空间还很多，可以加入新的请求
-        // 首先进行挨个判空
-        std::lock_guard<std::mutex> lock_w(waiting_mutex_);
+        // 严格遵守全局锁顺序：running_mutex_ -> waiting_mutex_
+        std::unique_lock<std::mutex> lock_r(running_mutex_);
+        std::unique_lock<std::mutex> lock_w(waiting_mutex_);
         while(!waiting_queue_.empty())
         {
             auto temp = waiting_queue_.front();
             int block_needed = blocks_needed_for_prefill(temp);
-            if(block_needed + WATER_MARK > allocator->num_free_blocks()) break; // 判断进去后是否要抢占，要抢的话还不如不进
+            if(block_needed + watermark > allocator->num_free_blocks()) break; // 判断进去后是否要抢占，要抢的话还不如不进
             // 为什么不是continue呢，如果放过大的去塞小的，那么大的就一直轮不到了
-            // prefill新请求，加入running_queue_和batch等待运行吧
+            // prefill新请求，加入running_queue_等待下一轮decode
             bool ok = prefill(temp->all_tokens, *temp, manager_);
             assert(ok);
             temp->s = ReqState::RUNNING;
@@ -369,8 +388,8 @@ void Scheduler::start_pool()
     workers_stop_ = false;
     round_ = 0;
     remaining_ = 0;
-    cur_begin_.assign(num_workers_, 0);
-    cur_end_.assign(num_workers_, 0);
+    cur_batch_size_ = 0;
+    next_task_idx_.store(0, std::memory_order_relaxed);
     workers_.reserve(num_workers_);
     for(int i = 0; i < num_workers_; ++i)
         workers_.emplace_back(&Scheduler::worker_loop, this, i);

@@ -7,8 +7,10 @@
 #include <stdexcept>
 
 // ====== 分配器成员实现 ======
-BlockAllocator::BlockAllocator(int num_blocks)
+BlockAllocator::BlockAllocator(int num_blocks, int block_size) : block_size_(block_size)
 {
+    assert(num_blocks >= 0 && "BlockAllocator: num_blocks must be non-negative");
+    assert(block_size_ > 0 && "BlockAllocator: block_size must be positive");
     blocks_.reserve(num_blocks);
     for(int i = 0; i < num_blocks; i++)
     {
@@ -62,6 +64,11 @@ void BlockAllocator::dec_ref(int block_id)
 int BlockAllocator::num_blocks() const
 {
     return static_cast<int>(blocks_.size());
+}
+
+int BlockAllocator::block_size() const
+{
+    return block_size_;
 }
 
 int BlockAllocator::num_free_blocks() const

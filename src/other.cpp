@@ -1,4 +1,4 @@
-﻿#include "kvcache.h"
+#include "kvcache.h"
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -16,6 +16,7 @@ int fake_sample(const Request& r)
 bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManager& manager)
 {
     auto allocator = manager.get_allocator();
+    const int blk_size = manager.block_size();
     manager.release(request); // 同一个 Request 重复 prefill 时先归还旧资源
 
     int N = static_cast<int>(prompt_tokens.size());
@@ -24,7 +25,7 @@ bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManag
         return true;
     }
 
-    int block_nums = (N + BLOCK_SIZE - 1) / BLOCK_SIZE; // 需要的块数
+    int block_nums = (N + blk_size - 1) / blk_size; // 需要的块数
     request.block_table.reserve(block_nums);
 
     // 进行复用判断与界定
@@ -52,10 +53,10 @@ bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManag
     request.all_tokens = prompt_tokens;
     for(int t = 0; t < N; t++)
     {
-        int logical_block_idx = t / BLOCK_SIZE; // 计算每个token属于哪个逻辑块
-        int offset = t % BLOCK_SIZE;            // 计算块内偏移
+        int logical_block_idx = t / blk_size; // 计算每个token属于哪个逻辑块
+        int offset = t % blk_size;            // 计算块内偏移
         int physical_block_id = request.block_table[logical_block_idx];
-        int slot_id = physical_block_id * BLOCK_SIZE + offset;
+        int slot_id = physical_block_id * blk_size + offset;
         request.slot_mapping.push_back(slot_id);
     }
     request.sequence_length = N;
@@ -69,9 +70,10 @@ bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManag
 int append_slot(BlockManager& manager, Request& request)
 {
     auto allocator = manager.get_allocator();
+    const int blk_size = manager.block_size();
     int N = request.sequence_length;
-    int offset = N % BLOCK_SIZE;
-    int tail_block_logical_id = N / BLOCK_SIZE;
+    int offset = N % blk_size;
+    int tail_block_logical_id = N / blk_size;
     int slot_id = -1;
 
     // 情况A：需要新增块
@@ -80,7 +82,7 @@ int append_slot(BlockManager& manager, Request& request)
         int new_block_id = allocator->allocate();
         if(new_block_id < 0) return -1;
         request.block_table.push_back(new_block_id);
-        slot_id = new_block_id * BLOCK_SIZE + offset;
+        slot_id = new_block_id * blk_size + offset;
     }
     else
     {
@@ -90,7 +92,7 @@ int append_slot(BlockManager& manager, Request& request)
         // 情况B：不需要新增且该块被该序列独占
         if(tail_block.ref_count == 1)
         {
-            slot_id = tail_block_physical_id * BLOCK_SIZE + offset;
+            slot_id = tail_block_physical_id * blk_size + offset;
         }
         // 情况C：不需要新增但处于共享状态，需要写时复制
         else
@@ -99,10 +101,10 @@ int append_slot(BlockManager& manager, Request& request)
             if(new_block_id < 0) return -1;
             request.block_table[tail_block_logical_id] = new_block_id; // 尾块更新
 
-            // 拷贝原尾块内的有效token进新的块，原尾块dec_ref
-            printf("copy valid tokens to new block\n"); // TODO: copy kv[0:offset]
+            // 拷贝原尾块内的有效token进新的块（当前为元信息模拟，仅计数不搬运真实 KV）
+            manager.record_cow_copy();
             allocator->dec_ref(tail_block_physical_id);
-            slot_id = new_block_id * BLOCK_SIZE + offset;
+            slot_id = new_block_id * blk_size + offset;
         }
     }
 
@@ -114,6 +116,7 @@ int append_slot(BlockManager& manager, Request& request)
 
 void append_token(BlockManager& manager, Request& request, int token)
 {
+    const int blk_size = manager.block_size();
     int N = request.sequence_length;
 
     // 仅当 token 序列与长度保持同步时才记录，以保证哈希基于真实内容
@@ -125,7 +128,7 @@ void append_token(BlockManager& manager, Request& request, int token)
     request.sequence_length += 1;
 
     // 块刚好写满，注册进前缀缓存
-    if(request.sequence_length % BLOCK_SIZE == 0)
+    if(request.sequence_length % blk_size == 0)
     {
         manager.register_block(request, request.num_cached_blocks);
     }

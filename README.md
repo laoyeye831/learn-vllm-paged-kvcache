@@ -228,12 +228,10 @@ clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
 
 This is a study project; the following are **deliberate simplifications**, not bugs waiting to be fixed:
 
-- **No real KV data.** The copy-on-write branch of `append_slot()` only prints `copy valid tokens to new block`; no tensors are moved. Blocks carry metadata only.
+- **No real KV data.** The copy-on-write branch of `append_slot()` only increments `BlockManager::num_cow_copies()`; no tensors are moved. Blocks carry metadata only.
 - **No LRU eviction.** `PhysicalBlock::last_accessed` is unused and `free_list_` is FIFO. Stale hash entries are caught by the `has_hash` / `hash` check instead of being evicted.
 - **No CPU swap.** Preemption uses release-and-recompute (which requires `all_tokens.size() == sequence_length`, i.e. a replayable prompt). The `SWAPPED` state exists but is unused.
-- **Static worker sharding.** Batches are split as `n / num_workers`, so a long task leaves other workers idle. Dynamic dispatch (a shared atomic cursor) is not implemented.
 - **Placeholder sampler.** `fake_sample()` is a deterministic hash so results can be compared token by token; no model is involved.
-- **Hard-coded constants.** `BLOCK_SIZE = 16` and `WATER_MARK = 4` are compile-time constants; there is no configuration file.
 - **No hash-collision fallback.** The 64-bit polynomial hash makes collisions vanishingly unlikely, but they are not otherwise guarded.
 
 ## Roadmap
@@ -242,11 +240,12 @@ This is a study project; the following are **deliberate simplifications**, not b
 - [x] `docs/ARCHITECTURE.md` / `docs/VLLM_MAPPING.md` / `docs/DEVLOG.md`
 - [x] GitHub Actions CI (Linux/GCC + Windows/MSVC + ThreadSanitizer + clang-format)
 - [x] `include/` + `src/` layout with a unified clang-format style
-- [ ] Dynamic worker dispatch (shared atomic cursor) to remove tail idle time
-- [ ] LRU eviction of free blocks, replacing the FIFO free list
-- [ ] Make `BLOCK_SIZE` / `WATER_MARK` configurable at runtime
-- [ ] Add GPU ↔ CPU swap semantics (currently `ReqState::SWAPPED` is unused)
+- [x] Dynamic worker dispatch (shared atomic cursor) to remove tail idle time
+- [x] Runtime-configurable `block_size`, `watermark` (absolute or ratio), and `enable_prefix_caching`
+- [x] Zero-copy prefix hashing + O(1) incremental `register_block` and full `running_mutex_` lock coverage
+- [ ] O(1) LRU eviction of free blocks, replacing the FIFO free list
 - [ ] Report cache hit rate and block utilization as comparable metrics
+- [ ] Explore Chunked Prefill / token budget (or GPU ↔ CPU swap comparison)
 
 ## Disclaimer
 

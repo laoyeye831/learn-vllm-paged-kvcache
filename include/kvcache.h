@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <vector>
 #include <unordered_map>
 #include <list>
@@ -13,8 +13,26 @@
 #include <functional>
 #include <future>
 
-constexpr int BLOCK_SIZE = 16; // 每个 block 存放 16 个 token 的 KV
-constexpr int WATER_MARK = 4;
+constexpr int DEFAULT_BLOCK_SIZE = 16; // 默认每个 block 存放 16 个 token 的 KV
+constexpr int DEFAULT_WATER_MARK = 4;  // 默认安全水位（块数）
+
+// 兼容旧代码默认常量
+constexpr int BLOCK_SIZE = DEFAULT_BLOCK_SIZE;
+constexpr int WATER_MARK = DEFAULT_WATER_MARK;
+
+// BlockManager 运行期配置
+struct BlockManagerConfig
+{
+    bool enable_prefix_caching{true}; // 是否启用前缀缓存匹配与注册
+};
+
+// Scheduler 运行期配置
+struct SchedulerConfig
+{
+    int num_workers{1};                       // Worker 采样线程数
+    int watermark_blocks{DEFAULT_WATER_MARK}; // 安全水位（绝对块数）；watermark_ratio >= 0 时忽略
+    double watermark_ratio{-1.0};             // 安全水位比例（如 0.01）；< 0 表示使用 watermark_blocks
+};
 
 // 状态枚举
 enum class ReqState : int
@@ -35,9 +53,9 @@ struct PhysicalBlock
     uint64_t hash{0};          // 前缀缓存中该块对应的链式哈希
     bool has_hash{false};      // 该块当前是否登记在前缀缓存中（重新分配时清除）
 
-    bool is_full(int num_tokens) const
+    bool is_full(int num_tokens, int block_size = DEFAULT_BLOCK_SIZE) const
     {
-        return num_tokens % BLOCK_SIZE == 0;
+        return num_tokens % block_size == 0;
     }
 };
 
@@ -45,7 +63,7 @@ struct PhysicalBlock
 class BlockAllocator
 {
 public:
-    explicit BlockAllocator(int num_blocks);
+    explicit BlockAllocator(int num_blocks, int block_size = DEFAULT_BLOCK_SIZE);
 
     int allocate();
     void free(int block_id);
@@ -54,12 +72,14 @@ public:
 
     int num_free_blocks() const;
     int num_blocks() const;
+    int block_size() const;
     PhysicalBlock& get_block(int block_id);
 
     // 只读检查接口，供测试 / 断言使用；不修改任何状态
     int ref_count_of(int block_id) const;
 
 private:
+    int block_size_{DEFAULT_BLOCK_SIZE};
     std::vector<PhysicalBlock> blocks_;
     std::list<int> free_list_; // 采用双向链表便于 LRU 扩展
     mutable std::mutex alloc_mutex_;
@@ -88,11 +108,13 @@ class BlockManager
 {
 private:
     BlockAllocator* allocator_;
+    BlockManagerConfig config_;
     std::unordered_map<uint64_t, int> hash_to_block_;
+    std::atomic<long long> num_cow_copies_{0}; // 累计写时复制次数
     //+LRU 相关数据结构
 
 public:
-    explicit BlockManager(BlockAllocator* allocator);
+    explicit BlockManager(BlockAllocator* allocator, BlockManagerConfig config = {});
     // 新请求进来时调用（只查询，不修改引用计数）
     // 返回：命中缓存的物理块列表 + 命中的 token 数
     struct PrefixMatch
@@ -102,13 +124,17 @@ public:
     };
     PrefixMatch match_prefix(const std::vector<int>& prompt_tokens);
 
-    // 把 request 中从第 begin 个块起、已写满的块注册进缓存（哈希链从第 0 块起计算）
+    // 把 request 中从第 begin 个块起、已写满的块注册进缓存（优先复用前一块哈希做到 O(1) 增量计算）
     void register_block(Request& request, int begin);
 
     // 释放请求
     void release(Request& req);
 
     BlockAllocator* get_allocator();
+    int block_size() const;
+    bool prefix_caching_enabled() const { return config_.enable_prefix_caching; }
+    long long num_cow_copies() const { return num_cow_copies_.load(); }
+    void record_cow_copy() { num_cow_copies_.fetch_add(1, std::memory_order_relaxed); }
 };
 
 // 抽象出单设备调度策略，负责请求的调度、抢占、换出等操作
@@ -146,9 +172,10 @@ private:
     int remaining_{0};                                                // 本轮还剩几个 Worker 没干完
     const std::vector<std::shared_ptr<Request>>* cur_batch_{nullptr}; // 本轮任务
     std::vector<int>* cur_out_{nullptr};                              // 本轮结果写到哪
-    std::vector<size_t> cur_begin_;                                   // 每个 Worker 负责区间的起点，长度 = num_workers_
-    std::vector<size_t> cur_end_;                                     // 每个 Worker 负责区间的终点
+    size_t cur_batch_size_{0};                                        // 本轮批次大小
+    std::atomic<size_t> next_task_idx_{0};                            // 动态分发共享游标
     std::exception_ptr worker_error_;                                 // Worker 里抛出的异常，交回主线程
+    SchedulerConfig config_;                                          // 运行期配置
     int num_workers_{1};                                              // worker 线程数
     bool pool_running_{false};                                        // Worker 池是否已启动
     std::atomic<bool> workers_stop_{false};
@@ -170,6 +197,10 @@ public:
     void set_step_hook(std::function<void(const Scheduler&)> hook);
 
     explicit Scheduler(BlockManager& manager, int num_workers = 1);
+    Scheduler(BlockManager& manager, SchedulerConfig config);
+
+    int watermark_blocks() const;
+    const SchedulerConfig& config() const { return config_; }
 
     // 加入新的请求至收件箱
     std::future<void> add_request(std::shared_ptr<Request> req);

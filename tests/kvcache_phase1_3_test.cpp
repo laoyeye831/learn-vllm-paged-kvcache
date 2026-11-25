@@ -1,4 +1,4 @@
-﻿#include "test_util.h"
+#include "test_util.h"
 #include <set>
 #include <algorithm>
 
@@ -809,6 +809,113 @@ void test_prefix_fork_then_decode_with_cache()
 }
 
 // =========================================================
+// v0.2.0：运行期配置、增量哈希与 CoW 计数
+// =========================================================
+
+void test_config_custom_block_size()
+{
+    constexpr int kBlk = 4;
+    BlockAllocator alloc(8, kBlk);
+    BlockManager mgr(&alloc);
+    EXPECT_EQ(alloc.block_size(), kBlk);
+    EXPECT_EQ(mgr.block_size(), kBlk);
+
+    // 10 token = 2 个满块(8) + 1 个半块(2)
+    auto prompt = make_tokens(10, 100);
+    Request a, b;
+    EXPECT_TRUE(prefill(prompt, a, mgr));
+    EXPECT_EQ((int)a.block_table.size(), 3);
+    EXPECT_EQ(a.num_cached_blocks, 2);
+    EXPECT_EQ(a.slot_mapping[9], a.block_table[2] * kBlk + 1);
+
+    // 第二个请求应复用前 2 个满块
+    EXPECT_TRUE(prefill(prompt, b, mgr));
+    EXPECT_EQ(b.block_table[0], a.block_table[0]);
+    EXPECT_EQ(b.block_table[1], a.block_table[1]);
+    EXPECT_TRUE(b.block_table[2] != a.block_table[2]);
+
+    // decode 填满第 3 块并跨到第 4 块
+    EXPECT_EQ(decode(mgr, a, 110), a.block_table[2] * kBlk + 2);
+    EXPECT_EQ(decode(mgr, a, 111), a.block_table[2] * kBlk + 3);
+    EXPECT_EQ(a.num_cached_blocks, 3);
+    EXPECT_EQ(mgr.match_prefix(a.all_tokens).num_matched_tokens, 12);
+
+    int sid = decode(mgr, a, 112);
+    EXPECT_EQ((int)a.block_table.size(), 4);
+    EXPECT_EQ(sid, a.block_table[3] * kBlk + 0);
+
+    mgr.release(a);
+    mgr.release(b);
+    EXPECT_EQ(alloc.num_free_blocks(), 8);
+}
+
+void test_config_disable_prefix_caching()
+{
+    BlockAllocator alloc(8);
+    BlockManager mgr(&alloc, BlockManagerConfig{/*enable_prefix_caching=*/false});
+    EXPECT_FALSE(mgr.prefix_caching_enabled());
+
+    auto prompt = make_tokens(32, 200);
+    Request a, b;
+    EXPECT_TRUE(prefill(prompt, a, mgr));
+    EXPECT_EQ(a.num_cached_blocks, 0);
+    EXPECT_EQ(mgr.match_prefix(prompt).num_matched_tokens, 0);
+
+    EXPECT_TRUE(prefill(prompt, b, mgr));
+    EXPECT_TRUE(a.block_table[0] != b.block_table[0]);
+    EXPECT_TRUE(a.block_table[1] != b.block_table[1]);
+    EXPECT_EQ(alloc.num_free_blocks(), 4);
+
+    mgr.release(a);
+    mgr.release(b);
+    EXPECT_EQ(alloc.num_free_blocks(), 8);
+}
+
+void test_cow_counter_increments()
+{
+    BlockAllocator alloc(8);
+    BlockManager mgr(&alloc);
+    Request father;
+    EXPECT_TRUE(prefill(make_tokens(10, 50), father, mgr));
+    EXPECT_EQ(mgr.num_cow_copies(), 0);
+
+    Request son = fork_sequence(father, alloc);
+    EXPECT_TRUE(decode(mgr, father, 60) >= 0); // 共享尾块 → 触发 CoW
+    EXPECT_EQ(mgr.num_cow_copies(), 1);
+
+    EXPECT_TRUE(decode(mgr, son, 61) >= 0); // 尾块已独占 → 不触发 CoW
+    EXPECT_EQ(mgr.num_cow_copies(), 1);
+
+    mgr.release(father);
+    mgr.release(son);
+    EXPECT_EQ(alloc.num_free_blocks(), 8);
+}
+
+void test_incremental_register_block_matches_full()
+{
+    // 验证 O(1) 增量 register_block 连续跨多块登记后，哈希链与完整前缀一致
+    BlockAllocator alloc(16, 4);
+    BlockManager mgr(&alloc);
+
+    Request a;
+    EXPECT_TRUE(prefill(make_tokens(6, 300), a, mgr)); // 1 满块 + 2 token
+    EXPECT_EQ(a.num_cached_blocks, 1);
+
+    // 连续 decode 10 个 token，总长 16 = 4 个满块
+    for(int t = 6; t < 16; ++t)
+        EXPECT_TRUE(decode(mgr, a, 300 + t) >= 0);
+    EXPECT_EQ(a.num_cached_blocks, 4);
+
+    auto full_prompt = make_tokens(16, 300);
+    auto m = mgr.match_prefix(full_prompt);
+    EXPECT_EQ(m.num_matched_tokens, 16);
+    EXPECT_EQ(m.cached_blocks, a.block_table);
+
+    mgr.release(a);
+    EXPECT_EQ(alloc.num_free_blocks(), 16);
+}
+
+// =========================================================
 int main()
 {
     std::cout << "========== 阶段一：分页与 Slot Mapping ==========\n";
@@ -858,6 +965,12 @@ int main()
     RUN_TEST(test_prefix_release_balance);
     RUN_TEST(test_prefix_reprefill_same_request);
     RUN_TEST(test_prefix_fork_then_decode_with_cache);
+
+    std::cout << "\n========== v0.2.0：配置化与增量哈希 ==========\n";
+    RUN_TEST(test_config_custom_block_size);
+    RUN_TEST(test_config_disable_prefix_caching);
+    RUN_TEST(test_cow_counter_increments);
+    RUN_TEST(test_incremental_register_block_matches_full);
 
     if(g_fail_count == 0)
     {
