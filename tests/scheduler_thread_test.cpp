@@ -389,7 +389,17 @@ void test_concurrent_queue_observers_safe()
     BlockManager mgr(&alloc);
     Scheduler sched(mgr, 2);
     sched.set_sampler(fake_sample);
-    sched.start();
+
+    // 先把 8 个请求全部放进 inbox_ 再 start()，保证首步同时准入、次步必然触发抢占
+    // （避免调度线程跑得太快，把请求逐个消化完导致不触发抢占的时序抖动）
+    std::vector<std::future<void>> futures;
+    std::vector<std::shared_ptr<Request>> reqs;
+    for(int i = 0; i < 8; ++i)
+    {
+        auto r = make_req(16, 8000 + i * 100, 32);
+        reqs.push_back(r);
+        futures.push_back(sched.add_request(r));
+    }
 
     std::atomic<bool> done{false};
     std::thread observer([&]
@@ -402,14 +412,7 @@ void test_concurrent_queue_observers_safe()
             (void)w;
         } });
 
-    std::vector<std::future<void>> futures;
-    std::vector<std::shared_ptr<Request>> reqs;
-    for(int i = 0; i < 8; ++i)
-    {
-        auto r = make_req(16, 8000 + i * 100, 32);
-        reqs.push_back(r);
-        futures.push_back(sched.add_request(r));
-    }
+    sched.start();
 
     bool ready = true;
     for(auto& f : futures)
@@ -419,6 +422,8 @@ void test_concurrent_queue_observers_safe()
 
     EXPECT_TRUE(ready);
     EXPECT_TRUE(sched.num_preemptions() > 0);
+    for(auto& r : reqs)
+        EXPECT_TRUE(r->s == ReqState::FINISHED);
     sched.stop(true);
     EXPECT_EQ(alloc.num_free_blocks(), 12);
 }
