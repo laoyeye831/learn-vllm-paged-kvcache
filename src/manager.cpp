@@ -1,10 +1,6 @@
 #include "kvcache.h"
 #include <algorithm>
-#include <memory>
-#include <string>
 #include <cassert>
-#include <functional>
-#include <stdexcept>
 
 constexpr uint64_t PREFIX_HASH_SEED = 123456789ULL;
 
@@ -20,7 +16,6 @@ static uint64_t compute_hash(uint64_t seed, const int* data, size_t len)
     return h;
 }
 
-
 // ====== 管理器成员实现 ======
 BlockManager::BlockManager(BlockAllocator* allocator, BlockManagerConfig config)
     : allocator_(allocator), config_(config)
@@ -33,9 +28,32 @@ BlockAllocator* BlockManager::get_allocator()
     return allocator_;
 }
 
+const BlockAllocator* BlockManager::get_allocator() const
+{
+    return allocator_;
+}
+
 int BlockManager::block_size() const
 {
     return allocator_->block_size();
+}
+
+int BlockManager::allocate_block()
+{
+    BlockAllocator::AllocOutcome out = allocator_->allocate_ex();
+    if(out.block_id < 0) return -1;
+    if(out.evicted) evict_hash_entry(out.block_id, out.evicted_hash);
+    return out.block_id;
+}
+
+void BlockManager::evict_hash_entry(int block_id, uint64_t hash)
+{
+    auto it = hash_to_block_.find(hash);
+    // 只有映射确实指向被淘汰的这个物理块时才删，避免误删同内容另一块的缓存条目
+    if(it != hash_to_block_.end() && it->second == block_id)
+    {
+        hash_to_block_.erase(it);
+    }
 }
 
 void BlockManager::register_block(Request& request, int begin)
@@ -77,6 +95,7 @@ void BlockManager::register_block(Request& request, int begin)
         auto& block = allocator_->get_block(physical_block_id);
         block.hash = seed;
         block.has_hash = true;
+        ++num_registrations_;
     }
     request.num_cached_blocks = std::max(request.num_cached_blocks, full_block_nums);
 }
@@ -97,9 +116,9 @@ BlockManager::PrefixMatch BlockManager::match_prefix(const std::vector<int>& pro
         if(it == hash_to_block_.end()) break;
 
         const auto& block = allocator_->get_block(it->second);
-        if(!block.has_hash || block.hash != seed) // 块已被重新分配，缓存项失效
+        if(!block.has_hash || block.hash != seed) // 兜底校验：块已失效则清理
         {
-            hash_to_block_.erase(it); // 移除失效的缓存信息
+            hash_to_block_.erase(it);
             break;
         }
         matched.cached_blocks.push_back(it->second);
@@ -118,4 +137,31 @@ void BlockManager::release(Request& req)
     req.slot_mapping.clear();
     req.sequence_length = 0;
     req.num_cached_blocks = 0;
+}
+
+void BlockManager::record_prefill_stats(int prompt_token_count, int query_blocks, int hit_blocks)
+{
+    if(prompt_token_count > 0) prompt_tokens_ += static_cast<uint64_t>(prompt_token_count);
+    if(query_blocks > 0) prefix_cache_queries_ += static_cast<uint64_t>(query_blocks);
+    if(hit_blocks > 0) prefix_cache_hits_ += static_cast<uint64_t>(hit_blocks);
+}
+
+void BlockManager::record_cow_copy(int copied_tokens)
+{
+    ++num_cow_copies_;
+    if(copied_tokens > 0) num_cow_tokens_ += static_cast<uint64_t>(copied_tokens);
+}
+
+
+void BlockManager::record_prefill_stats(int prompt_token_count, int query_blocks, int hit_blocks)
+{
+    if(prompt_token_count > 0) prompt_tokens_ += static_cast<uint64_t>(prompt_token_count);
+    if(query_blocks > 0) prefix_cache_queries_ += static_cast<uint64_t>(query_blocks);
+    if(hit_blocks > 0) prefix_cache_hits_ += static_cast<uint64_t>(hit_blocks);
+}
+
+void BlockManager::record_cow_copy(int copied_tokens)
+{
+    ++num_cow_copies_;
+    if(copied_tokens > 0) num_cow_tokens_ += static_cast<uint64_t>(copied_tokens);
 }

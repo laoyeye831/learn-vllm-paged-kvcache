@@ -118,3 +118,17 @@
 **遗留**：目前给 Worker 线程们实现的还是**静态分配**。一旦某个线程被分到耗时很长的任务，其他线程都会空等，严重浪费计算资源；或者某批次任务量不足时大量 Worker 闲置，同样是浪费。需要改为**动态分发**，采用共享的原子游标。
 
 > 这条已经写进 README 的 Roadmap（「Worker 池改为动态分发」），是下一步最值得做的改动。
+
+---
+
+## Day 8（v0.2.0 → v0.3.0）
+
+**目标**：先完成 v0.2.0 工程清理（运行期配置、动态 Worker 游标、零拷贝 $O(1)$ 增量哈希、`running_mutex_` 锁补齐），再落地 v0.3.0（$O(1)$ 侵入式空闲队列、三态 LRU 淘汰、主动哈希清理与可复现 benchmark）。
+
+**关键设计决策与踩坑记录**：
+
+- **为什么 `blocks_needed_for_prefill` 必须只扣 `ref_count > 0` 的命中块**：初看似乎所有命中块都不消耗空间，但 `ref_count == 0` 的 `CACHED` 空闲块位于空闲链表中，复活时会 `unlink` 并使 `num_free_blocks()` 减 1。如果把它算作 0 成本，准入检查会误判可用空间，导致击穿 watermark 甚至 `prefill` OOM。
+- **消除阶段三的双重 `match_prefix`**：阶段三预检与 `prefill()` 原本各算一次前缀哈希，不仅浪费计算还会让指标翻倍；改为阶段三只算一次并通过 `precomputed_match` 传入 `prefill()`。
+- **淘汰清理哈希表的 `it->second == block_id` 守卫**：同一段内容若曾被两个物理块登记，淘汰旧块时不能无条件 `erase(hash)`，必须确认当前映射确实指向被淘汰的块。
+- **`last_accessed` 的打点时机**：为了保证 LRU 空闲链表中 `CACHED` 后缀的 `last_accessed` 单调不减，必须在块归还为空闲（`push_free_locked`）时刷新时间戳，而不仅仅在分配/复活时。
+- **TTFT / TPOT 用步数而非墙钟**：同 seed 下步数指标完全确定，不会被 OS 线程调度噪声淹没，适合做 FIFO vs LRU 的严格 A/B 对照。

@@ -21,10 +21,10 @@ void test_allocator_allocate_unique()
 {
     BlockAllocator alloc(4);
     BlockManager mgr(&alloc);
-    int b0 = alloc.allocate();
-    int b1 = alloc.allocate();
-    int b2 = alloc.allocate();
-    int b3 = alloc.allocate();
+    int b0 = mgr.allocate_block();
+    int b1 = mgr.allocate_block();
+    int b2 = mgr.allocate_block();
+    int b3 = mgr.allocate_block();
     EXPECT_TRUE(b0 >= 0 && b1 >= 0 && b2 >= 0 && b3 >= 0);
 
     std::set<int> ids{b0, b1, b2, b3};
@@ -40,9 +40,9 @@ void test_allocator_exhaust()
 {
     BlockAllocator alloc(2);
     BlockManager mgr(&alloc);
-    EXPECT_TRUE(alloc.allocate() >= 0);
-    EXPECT_TRUE(alloc.allocate() >= 0);
-    EXPECT_EQ(alloc.allocate(), -1); // 用尽
+    EXPECT_TRUE(mgr.allocate_block() >= 0);
+    EXPECT_TRUE(mgr.allocate_block() >= 0);
+    EXPECT_EQ(mgr.allocate_block(), -1); // 用尽
     EXPECT_EQ(alloc.num_free_blocks(), 0);
 }
 
@@ -50,8 +50,8 @@ void test_allocator_reclaim()
 {
     BlockAllocator alloc(2);
     BlockManager mgr(&alloc);
-    int b0 = alloc.allocate();
-    int b1 = alloc.allocate();
+    int b0 = mgr.allocate_block();
+    int b1 = mgr.allocate_block();
     EXPECT_EQ(alloc.num_free_blocks(), 0);
 
     alloc.dec_ref(b0);
@@ -62,7 +62,7 @@ void test_allocator_reclaim()
     EXPECT_EQ(alloc.num_free_blocks(), 2);
 
     // 回收后可再次分配
-    EXPECT_TRUE(alloc.allocate() >= 0);
+    EXPECT_TRUE(mgr.allocate_block() >= 0);
     EXPECT_EQ(alloc.num_free_blocks(), 1);
 }
 
@@ -70,7 +70,7 @@ void test_allocator_inc_dec_balance()
 {
     BlockAllocator alloc(2);
     BlockManager mgr(&alloc);
-    int b0 = alloc.allocate();
+    int b0 = mgr.allocate_block();
     EXPECT_EQ(alloc.get_block(b0).ref_count, 1);
 
     alloc.inc_ref(b0);
@@ -629,8 +629,8 @@ void test_prefix_hit_after_owner_released()
     EXPECT_EQ(alloc.num_free_blocks(), 2);
 
     // 被复用的块不能再被 allocate 重复分配出去
-    int x = alloc.allocate();
-    int y = alloc.allocate();
+    int x = mgr.allocate_block();
+    int y = mgr.allocate_block();
     EXPECT_TRUE(x >= 0 && y >= 0);
     EXPECT_TRUE(x != old_table[0] && x != old_table[1]);
     EXPECT_TRUE(y != old_table[0] && y != old_table[1]);

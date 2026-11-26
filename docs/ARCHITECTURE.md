@@ -52,16 +52,22 @@ flowchart TB
 ### 2.1 PhysicalBlock —— 物理块
 
 ```cpp
+enum class FreeTier : uint8_t { NONE, CLEAN, CACHED };
+enum class FreePolicy { FIFO, LRU };
+
 struct PhysicalBlock {
     int block_id;
     int ref_count{0};          // 被多少条序列引用
-    uint64_t last_accessed{0}; // 预留给 LRU，当前未使用
+    uint64_t last_accessed{0}; // 分配/复活/归还为缓存块时的逻辑时钟戳
     uint64_t hash{0};          // 该块在前缀链上的哈希
     bool has_hash{false};      // 是否仍登记在前缀缓存中
+    int free_prev{-1};         // 侵入式双向链表前驱（-1 表示无）
+    int free_next{-1};         // 侵入式双向链表后继（-1 表示无）
+    FreeTier tier{FreeTier::NONE};
 };
 ```
 
-`has_hash` 与 `hash` 组成**双字段校验**：块被 `allocate()` 复用时会清掉 `has_hash`，`match_prefix()` 命中后要再确认一次，避免把「哈希表里残留的条目」当成有效缓存。
+物理块分配统一经由 `BlockManager::allocate_block()` 调用私有 `BlockAllocator::allocate_ex()`（通过 `friend` 约束）。当队首是 `CACHED` 块时，先读出旧 `hash` 再清空 `has_hash`，随后由 `BlockManager::evict_hash_entry()` 主动清理 `hash_to_block_`（带 `it->second == block_id` 守卫防止同内容双块误删），保证哈希表有界（`hash_to_block_.size() <= num_blocks`）。
 
 ### 2.2 Request —— 一条推理请求
 
@@ -137,28 +143,39 @@ sequenceDiagram
 **为什么阶段三要「没抢占才进新请求」？**
 发生抢占说明显存已经紧张，此时再放进新请求只会引发连锁抢占，把刚被抢占的请求又挤出去。等下一轮空间释放后再准入，抖动更小。
 
-## 4. 引用计数与写时复制
+## 4. 三态模型、LRU 单链与写时复制
 
 ```mermaid
 stateDiagram-v2
     direction LR
-    [*] --> Free: 初始化，ref=0，在 free_list_
-    Free --> Allocated: allocate()<br/>ref 0→1，has_hash=false
-    Allocated --> Shared: inc_ref()<br/>ref→2+（fork / 前缀命中）
-    Shared --> Allocated: dec_ref()<br/>ref 回到 1
-    Allocated --> Free: dec_ref()<br/>ref→0，回到 free_list_
-    Shared --> Free: dec_ref() 逐次归零
+    [*] --> CleanFree: 初始化，ref=0，has_hash=false
+    CleanFree --> InUse: allocate_ex()<br/>零缓存损失
+    InUse --> Shared: inc_ref()<br/>ref→2+（fork / 前缀命中）
+    Shared --> InUse: dec_ref()<br/>ref 回到 1
+    InUse --> CleanFree: dec_ref()→0<br/>has_hash=false（LRU push_front）
+    InUse --> CachedFree: dec_ref()→0<br/>has_hash=true（LRU push_back）
+    CachedFree --> InUse: inc_ref() O(1) 复活<br/>前缀缓存命中
+    CachedFree --> InUse: allocate_ex() 淘汰<br/>先清 hash_to_block_ 再复用
 ```
+
+**一条侵入式双向链表同时表达「优先吃干净块 + 缓存块 LRU 淘汰」**：
+
+```text
+head                                                                    tail
+[ clean(newest) ... clean(oldest) | cached(oldest) ... cached(newest) ]
+  ↑ allocate_ex() 永远从 head 取                  ↑ 只有 clean 耗尽才会淘汰
+```
+
+- **LRU 策略**：`CLEAN` 块 `push_front`、`CACHED` 块 `push_back`（并刷新 `last_accessed`），天然保持「clean 前缀 + cached 后缀」单链不变量；`inc_ref()` 复活空闲块直接 `unlink_locked()`，$O(1)$ 摘链。
+- **FIFO 策略**：所有空闲块一律 `push_back`，与 LRU 共用同一套链表代码，便于做对照基准实验。
 
 **尾块写入时的三种情况**（`append_slot()`）：
 
 | 条件 | 行为 | 代价 |
 |---|---|---|
-| `seq_len % 16 == 0` | 新块边界，`allocate()` 一个新块追加到 `block_table` | 1 块 |
+| `seq_len % block_size == 0` | 新块边界，`allocate_block()` 一个新块追加到 `block_table` | 1 块 |
 | 尾块 `ref_count == 1` | 独占，原地写入 | 0 |
-| 尾块 `ref_count > 1` | **CoW**：分配新块 → 替换 `block_table` 尾项 → 拷贝有效 token → 原块 `dec_ref` | 1 块 + 一次拷贝 |
-
-> `ref_count == 0` 但 `has_hash == true` 的块可以被 `inc_ref()` 直接「复活」：`inc_ref` 会先把它从 `free_list_` 里摘掉（`list::remove`，O(n)），从而让已释放但内容仍有效的块被前缀缓存命中后重新使用。
+| 尾块 `ref_count > 1` | **CoW**：分配新块 → 替换 `block_table` 尾项 → 记录 `record_cow_copy(offset)` → 原块 `dec_ref` | 1 块 + `offset` 个槽位拷贝 |
 
 ## 5. 并发模型
 
@@ -216,14 +233,16 @@ sequenceDiagram
 
 ## 6. 不变量
 
-`tests/test_util.h` 的 `check_invariants()` 在每个 step 之后（通过 `set_step_hook`）验证以下四条，任一不满足直接 `abort`：
+`tests/test_util.h` 的 `check_invariants()` 在每个 step 之后（通过 `set_step_hook`）验证以下不变量，任一不满足直接 `abort`：
 
-1. 每个物理块的 `ref_count` == 所有活跃请求（`RUNNING ∪ WAITING`）在 `block_table` 中引用它的次数；
-2. `ref_count == 0` 的块数 == `free_list_.size()`；
-3. `RUNNING` 请求满足 `block_table.size() == ceil(sequence_length / BLOCK_SIZE)`；
-4. `WAITING` 请求（被抢占后已 `release`）的 `block_table` 必须为空。
+1. **I1（三态一致）**：`ref_count == 0` 当且仅当 `tier != FreeTier::NONE`（在空闲链表中）；在用块的 `free_prev == free_next == -1`；
+2. **I2（空闲计数一致）**：`num_free_blocks() == num_free_clean() + num_free_cached()`，且等于 `ref_count == 0` 的物理块总数；
+3. **I3（层级与哈希一致）**：`tier == CACHED ⇒ has_hash`，`tier == CLEAN ⇒ !has_hash`；
+4. **I4（LRU 单链布局）**：LRU 策略下，空闲链表为「clean 前缀 + cached 后缀」，且 cached 后缀的 `last_accessed` 单调不减；链表无环、前后指针自洽；
+5. **I5（哈希表有界）**：`hash_to_block_.size() <= has_hash 块数 <= num_blocks`；
+6. **I6（队列与引用计数）**：每个物理块的 `ref_count` == 所有活跃请求（`RUNNING ∪ WAITING`）在 `block_table` 中引用它的次数；`RUNNING` 满足 `block_table.size() == ceil(sequence_length / block_size)`；`WAITING` 的 `block_table` 必须为空。
 
-这四条同时钉住了「泄漏」（块没还回去）、「重复释放」（ref 掉到负数）、「表长不一致」（append 逻辑错位）三类最容易出现的 bug。随机压力测试会在此基础上再做一层**对拍**：同一批随机负载分别在小池（频繁抢占）和大池（无抢占）下跑，要求输出 token 逐个相同。
+随机压力测试会在此基础上再做一层**对拍**：同一批随机负载分别在小池（频繁抢占）和大池（无抢占）下跑，要求输出 token 逐个相同。
 
 ## 7. 生命周期与停机
 
@@ -247,7 +266,6 @@ stateDiagram-v2
 | 简化 | 影响 |
 |---|---|
 | KV 内容是整数模拟，CoW 仅计数不搬运 | 无法测量真实拷贝开销 |
-| 空闲链表是 FIFO，`last_accessed` 未使用 | 没有 LRU 淘汰，块回收后靠 `has_hash` 校验失效 |
 | 抢占只做「释放 + 重算」，无 `SWAPPED` | `ReqState::SWAPPED` 目前是死枚举 |
 
 完整清单见 README 的「已知限制」一节。

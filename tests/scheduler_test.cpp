@@ -40,7 +40,7 @@ void test_sched_preempt_last_arrival()
 
     // 模拟其他占用者，把空闲块压到 1
     for(int i = 0; i < 4; ++i)
-        EXPECT_TRUE(alloc.allocate() >= 0);
+        EXPECT_TRUE(mgr.allocate_block() >= 0);
     EXPECT_EQ(alloc.num_free_blocks(), 1);
 
     // 第 2 步：A 拿走最后一块；B 不够 → 抢占队尾的 C；B 随后拿到 C 释放的块

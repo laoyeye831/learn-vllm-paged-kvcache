@@ -14,12 +14,12 @@
 | `Request` | `vllm/sequence.py: Sequence` / `SequenceGroup` | `vllm/v1/request.py: Request` | 去掉了 sampling params、LoRA、多序列组等，只留 block_table / slot_mapping / 生成长度 |
 | `ReqState` | `vllm/sequence.py: SequenceStatus` | `vllm/v1/request.py: RequestStatus` | 保留了 `SWAPPED` 但未使用（本项目不做 CPU 换出） |
 | `BlockAllocator` | `vllm/core/block/common.py: BlockAllocator`<br/>`vllm/core/block/naive_block.py: NaiveBlockAllocator` | `vllm/v1/core/block_pool.py: BlockPool` | 只做单设备、单池；没有 `device=CPU/GPU` 双池，也没有 `cached_block_hash_to_block` |
-| `free_list_` | `NaiveBlockAllocator._free_blocks`（`deque`） | `BlockPool.free_block_queue`（双向链表 + LRU 语义） | 本项目是 `std::list` 的 **FIFO**；vLLM v1 的 `free_block_queue` 是 O(1) 双向链表并支持 LRU |
+| `free_head_` / `free_tail_` + 侵入式链表 | `NaiveBlockAllocator._free_blocks`（`deque`） | `BlockPool.free_block_queue`（`FreeKVCacheBlockQueue` 侵入式双向链表 + LRU） | v0.3.0 已升级为 $O(1)$ 侵入式双向链表，支持 `FreePolicy::LRU`（CLEAN 前缀 + CACHED 后缀）与 `FreePolicy::FIFO` 对照 |
 | `ref_count` | `PhysicalTokenBlock.ref_count` | `KVCacheBlock.ref_cnt` | 语义一致（含 `<=1` 表示不会被共享） |
-| `BLOCK_SIZE = 16` | `block_size` 参数，默认 16 | 同 | 本项目为编译期常量，不可配置 |
+| `block_size`（默认 16） | `block_size` 参数，默认 16 | 同 | v0.2.0 起运行期可配置 |
 | `slot_mapping` | `vllm/worker/model_runner.py: _compute_slot_mapping`<br/>`vllm/attention/backends/flash_attn.py` | `vllm/v1/worker/block_table.py` + attention metadata | 语义一致：本步 token 在展平 KV cache 中的物理槽号；**每步重建，不是历史累积** |
 | `block_table` | `vllm/worker/model_runner.py` 的 block tables | `vllm/v1/worker/block_table.py: BlockTable` | 本项目是 `std::vector<int>` 逻辑→物理映射 |
-| `WATER_MARK = 4` | `Scheduler` 的 `watermark`（默认 **0.01**，按块数比例） | 同 | 本项目是绝对块数，vLLM 是比例 |
+| `SchedulerConfig::watermark_*` | `Scheduler` 的 `watermark`（默认 **0.01**，按块数比例） | 同 | v0.2.0 起同时支持绝对块数与比例模式 |
 
 ## 2. 块管理（`src/manager.cpp`）
 
@@ -30,7 +30,8 @@
 | `compute_hash`（多项式滚动哈希） | `prefix_caching_block.py: hash_block_tokens` / `hash_request_tokens` | `vllm/v1/core/kv_cache_utils.py: get_block_hash` | vLLM 用 `hash((parent_hash, tuple(token_ids)))`（Python 内置哈希 + `NONE_HASH`）；本项目用 `h = h*BASE + token` 的 64 位多项式。**两者都是「父哈希 + 本块 token」的链式结构** |
 | `register_block(req, begin)` | `PrefixCachingBlockAllocator.allocate_immutable_block` 内部登记哈希 | `KVCacheManager.cache_full_blocks` | 本项目的 `begin` 参数用于「跳过已缓存的块，只推进哈希链」；vLLM 通过 `num_cached_blocks` 区分 |
 | `match_prefix()` | `PrefixCachingBlockAllocator.get_num_common_prefix_blocks` / `find_longest_cache_hit` | `KVCacheManager.get_computed_blocks` | 本项目**同时**返回块列表与命中 token 数，且命中后要复核 `has_hash && hash == seed` |
-| `has_hash` / `hash` 双字段校验 | vLLM 依赖「块被回收时从哈希表移除」保证一致性 | v1 用 `KVCacheBlock.block_hash` 哨兵值 + 引用计数保证 | 本项目选择**惰性验证**：块被 `allocate()` 复用后只清 `has_hash`，命中时发现失效再 `erase`，避免在分配路径上维护哈希表 |
+| `evict_hash_entry()` + `allocate_ex()` | vLLM 依赖「块被回收/淘汰时从哈希表移除」保证一致性 | v1 `BlockPool._maybe_evict_cached_block` | v0.3.0 通过 `friend class BlockManager` 将「淘汰 CACHED 块 + 清理 `hash_to_block_`」绑定为原子路径，带 `it->second == block_id` 守卫，保证哈希表有界 |
+| `BlockManager` / `BlockAllocator` 统计指标 | `PrefixCacheStats` / `SchedulerStats` | `vllm/v1/metrics/stats.py: PrefixCacheStats` | 提供 `prefix_cache_queries`、`prefix_cache_hits`、`num_evictions`、`num_revivals`、`num_cow_copies` 与步数级 TTFT/TPOT |
 | `release(req)` | `BlockSpaceManagerV1.free` + `PrefixCachingBlockAllocator.free` | `KVCacheManager.free` | 语义一致：逐个 `dec_ref`，并清空 `block_table` / `slot_mapping` |
 
 ## 3. 请求原语（`src/other.cpp`）
@@ -72,11 +73,11 @@
 |---|---|
 | CPU ↔ GPU swap（`_swap_out` / `_swap_in`） | ❌ 只做「释放 + 重算」，`ReqState::SWAPPED` 未被使用 |
 | Chunked prefill | ❌ prefill 必须一次装下整个 prompt |
-| LRU 空闲块淘汰 | ❌ 空闲链表 FIFO，`last_accessed` 已预留未使用 |
+| LRU 空闲块淘汰 | ✅ v0.3.0 已实现 $O(1)$ 侵入式链表 LRU（CLEAN 优先 + CACHED LRU）及 FIFO 对照 |
 | 真实 PagedAttention kernel / `copy_blocks` | ❌ KV 内容用整数模拟 |
 | 多设备 / TP / PP | ❌ 单设备单池 |
 | Beam search / parallel sampling 的真实用法 | ⚠️ 只实现了 `fork_sequence` 的引用计数语义，没有调度器层的分支管理 |
-| Prefix caching 的 LRU 驱逐与命中率统计 | ⚠️ 有命中与失效校验，无统计、无主动驱逐 |
+| Prefix caching 的 LRU 驱逐与命中率统计 | ✅ v0.3.0 已实现主动驱逐、指标统计与 `bench/kvcache_bench.cpp` 对照基准 |
 | CUDA Graph / 多进程 worker | ❌ |
 
 ## 7. 想深入读 vLLM 时建议的阅读顺序

@@ -1,4 +1,4 @@
-﻿// random_pressure_test.cpp
+// random_pressure_test.cpp
 // 随机压力测试：同一批随机请求在小池（频繁抢占）与大池（无抢占）下运行，
 // 每步检查块引用计数等不变量，并要求两边的生成结果逐个相同。
 // 不变量检查函数与 CHECK 宏见 test_util.h。
@@ -123,7 +123,7 @@ RunResult run_workload(int pool_size,
             std::abort();
         }
         sched.step();
-        if(check_inv) check_invariants(sched, allocator);
+        if(check_inv) check_invariants(sched, allocator, &manager);
     }
     sched.stop_pool(); // 主线程已收工，回收 Worker
 

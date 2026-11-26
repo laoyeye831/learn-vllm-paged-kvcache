@@ -112,7 +112,8 @@ inline int run_until_done(Scheduler& sched, int max_steps = 10000)
     return steps;
 }
 
-inline void check_invariants(const Scheduler& sched, const BlockAllocator& allocator)
+inline void check_invariants(const Scheduler& sched, const BlockAllocator& allocator,
+                             const BlockManager* manager = nullptr)
 {
     const int n = allocator.num_blocks();
 
@@ -134,10 +135,14 @@ inline void check_invariants(const Scheduler& sched, const BlockAllocator& alloc
         }
     }
 
-    // 3) ref_count 与 free 数量
+    // 3) ref_count、tier、clean/cached 计数与 has_hash 一致性（I1, I2, I3, I6）
     int zero_count = 0;
+    int clean_count = 0;
+    int cached_count = 0;
+    int has_hash_count = 0;
     for(int i = 0; i < n; i++)
     {
+        const PhysicalBlock& b = allocator.get_block(i);
         int actual = allocator.ref_count_of(i);
         if(actual != expected_ref[i])
         {
@@ -146,9 +151,70 @@ inline void check_invariants(const Scheduler& sched, const BlockAllocator& alloc
                     i, actual, expected_ref[i]);
             std::abort();
         }
-        if(actual == 0) zero_count++;
+        if(b.has_hash) ++has_hash_count;
+        if(actual == 0)
+        {
+            ++zero_count;
+            CHECK(b.tier != FreeTier::NONE); // I1
+            if(b.tier == FreeTier::CACHED)
+            {
+                CHECK(b.has_hash); // I3
+                ++cached_count;
+            }
+            else
+            {
+                CHECK(!b.has_hash); // I3
+                ++clean_count;
+            }
+        }
+        else
+        {
+            CHECK(b.tier == FreeTier::NONE); // I1
+            CHECK(b.free_prev == -1 && b.free_next == -1);
+        }
     }
     CHECK(zero_count == allocator.num_free_blocks());
+    CHECK(clean_count == allocator.num_free_clean());
+    CHECK(cached_count == allocator.num_free_cached());
+    CHECK(allocator.num_free_blocks() == allocator.num_free_clean() + allocator.num_free_cached()); // I2
+
+    // 3.5) 侵入式空闲链表完整性 + LRU 布局不变量（I4）
+    int visited = 0;
+    bool seen_cached = false;
+    uint64_t prev_cached_ts = 0;
+    int prev_id = -1;
+    for(int cur = allocator.free_head(); cur >= 0;)
+    {
+        CHECK(cur >= 0 && cur < n);
+        CHECK(visited < n); // 防止成环
+        const PhysicalBlock& b = allocator.get_block(cur);
+        CHECK(b.free_prev == prev_id);
+        CHECK(b.ref_count == 0 && b.tier != FreeTier::NONE);
+        if(allocator.policy() == FreePolicy::LRU)
+        {
+            if(b.tier == FreeTier::CACHED)
+            {
+                seen_cached = true;
+                CHECK(b.last_accessed >= prev_cached_ts); // I4：cached 后缀时间戳单调不减
+                prev_cached_ts = b.last_accessed;
+            }
+            else
+            {
+                CHECK(!seen_cached); // I4：clean 前缀不可出现在 cached 后缀之后
+            }
+        }
+        prev_id = cur;
+        cur = b.free_next;
+        ++visited;
+    }
+    CHECK(visited == zero_count);
+    CHECK(prev_id == allocator.free_tail());
+
+    // 3.6) 哈希表有界不变量（I5）
+    if(manager != nullptr)
+    {
+        CHECK(static_cast<int>(manager->num_hash_entries()) <= has_hash_count);
+    }
 
     // 4) RUNNING 请求的 block_table 长度
     const int blk_size = allocator.block_size();

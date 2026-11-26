@@ -1,4 +1,4 @@
-﻿// thread_stress_test.cpp
+// thread_stress_test.cpp
 // M5：多线程压力测试
 // 多个生产者线程随机间隔提交请求，调度线程 + Worker 池并发执行；
 // 每一步都通过 step hook 检查不变量，最终结果必须与单线程 step() 驱动的基线逐个相同。
@@ -97,7 +97,7 @@ static Outcome run_baseline(const std::vector<RequestSpec>& specs, int pool_size
     sched.set_sampler(fake_sample);
     sched.set_step_hook([&](const Scheduler& s)
                         {
-        check_invariants(s, allocator);
+        check_invariants(s, allocator, &manager);
         ++hook_steps; });
 
     std::vector<std::shared_ptr<Request>> reqs;
@@ -151,7 +151,7 @@ static Outcome run_threaded(const std::vector<RequestSpec>& specs, int pool_size
     sched.set_sampler(fake_sample);
     sched.set_step_hook([&](const Scheduler& s)
                         {
-        check_invariants(s, allocator);   // 在调度线程里执行，此时没有其他线程改状态
+        check_invariants(s, allocator, &manager); // 在调度线程里执行，此时没有其他线程改状态
         ++hook_steps; });
     sched.start();
 

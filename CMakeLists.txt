@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20)
 project(KV_Cache LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -40,7 +40,7 @@ endif()
 # ========== 测试：每个 cpp 自带 main ==========
 enable_testing()
 
-foreach(test_name IN ITEMS kvcache_phase1_3_test scheduler_test random_pressure_test scheduler_thread_test thread_stress_test)
+foreach(test_name IN ITEMS kvcache_phase1_3_test eviction_test scheduler_test random_pressure_test scheduler_thread_test thread_stress_test)
     add_executable(${test_name} tests/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE KV_Cache_lib)
     add_test(NAME ${test_name} COMMAND ${test_name})
@@ -52,8 +52,9 @@ if(KV_CACHE_ENABLE_TSAN)
         PROPERTIES LABELS concurrency TIMEOUT 900)
 endif()
 
-# ========== 示例：可执行 demo，不注册为测试 ==========
+# ========== 示例与基准 ==========
 option(KV_CACHE_BUILD_EXAMPLES "Build examples/demo.cpp" ON)
+option(KV_CACHE_BUILD_BENCHMARKS "Build bench/kvcache_bench.cpp" ON)
 
 if(KV_CACHE_BUILD_EXAMPLES)
     add_executable(kvcache_demo examples/demo.cpp)
@@ -61,4 +62,9 @@ if(KV_CACHE_BUILD_EXAMPLES)
     # 冒烟测试：demo 必须能跑完（覆盖调度器终止性与停机路径）
     add_test(NAME kvcache_demo COMMAND kvcache_demo)
     set_tests_properties(kvcache_demo PROPERTIES LABELS demo TIMEOUT 120)
+endif()
+
+if(KV_CACHE_BUILD_BENCHMARKS)
+    add_executable(kvcache_bench bench/kvcache_bench.cpp)
+    target_link_libraries(kvcache_bench PRIVATE KV_Cache_lib)
 endif()

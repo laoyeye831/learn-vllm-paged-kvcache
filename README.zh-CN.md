@@ -229,11 +229,28 @@ clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
 
 这是学习项目，以下部分是**刻意简化**的，不是待修复的 bug：
 
-- **没有真实 KV 数据**：`append_slot()` 的 CoW 分支仅通过 `BlockManager::num_cow_copies()` 计数，不搬运 tensor；每个块只记录元信息。
-- **没有 LRU 淘汰**：`PhysicalBlock::last_accessed` 目前未被使用，`free_list_` 是 FIFO。块回收后其哈希条目靠 `has_hash` / `hash` 校验失效，不做主动驱逐。
+- **没有真实 KV 数据**：`append_slot()` 的 CoW 分支仅通过 `BlockManager::num_cow_copies()` / `num_cow_tokens()` 计数，不搬运 tensor；每个块只记录元信息。
 - **没有 swap 到 CPU**：抢占走「释放 + 重算」路径（要求 `all_tokens.size() == sequence_length`，即 prompt 可重放），不实现 Swapped 状态。
 - **采样器是占位实现**：`fake_sample()` 是一个确定性哈希函数，用于让结果可对拍，不涉及任何模型。
 - **哈希无碰撞兜底**：链式多项式哈希 64 位，理论碰撞概率极低但未做额外校验。
+
+## Benchmark（FIFO vs LRU vs Prefix Off）
+
+构建后可运行 `./build/kvcache_bench --sweep`（默认 `seed=42`，`block_size=16`，支持 `--workload sysprompt|chat|zipf`、`--blocks N`、`--policy fifo|lru`、`--prefix on|off`、`--csv`）：
+
+| workload | blocks | policy / prefix | hit% | evictions | revivals | preempt | steps | tok/step |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| `sysprompt` | 24 | `prefix off` | 0.0% | 0 | 0 | 1 | 510 | 2.24 |
+| `sysprompt` | 24 | `fifo` + prefix | 71.7% | 187 | 30 | 0 | 307 | 3.72 |
+| `sysprompt` | 24 | `lru` + prefix | **73.0%** | **178** | **36** | 0 | 307 | 3.72 |
+| `chat` | 64 | `prefix off` | 0.0% | 0 | 0 | 0 | 174 | 3.80 |
+| `chat` | 64 | `fifo` + prefix | 15.0% | 344 | 64 | 0 | 174 | 3.80 |
+| `chat` | 64 | `lru` + prefix | **17.6%** | **332** | **75** | 0 | 174 | 3.80 |
+| `zipf` | 32 | `prefix off` | 0.0% | 0 | 0 | 1 | 252 | 3.70 |
+| `zipf` | 32 | `fifo` + prefix | 51.1% | 207 | 28 | 0 | 250 | 3.73 |
+| `zipf` | 32 | `lru` + prefix | **53.3%** | **195** | **36** | 0 | 250 | 3.73 |
+| `zipf` | 48 | `fifo` + prefix | 61.1% | 158 | 64 | 0 | 250 | 3.73 |
+| `zipf` | 48 | `lru` + prefix | **64.4%** | **139** | **76** | 0 | 250 | 3.73 |
 
 ## Roadmap
 
@@ -244,8 +261,8 @@ clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
 - [x] Worker 池改为动态分发（共享原子游标），消除长尾空等
 - [x] 把 `block_size` / `watermark`（含比例模式）/ `enable_prefix_caching` 改为运行期可配置
 - [x] 前缀哈希零拷贝 + `register_block` $O(1)$ 增量计算，补齐队列并发观察锁保护
-- [ ] 引入 $O(1)$ LRU 空闲块淘汰，替换 FIFO 空闲链表
-- [ ] 统计缓存命中率与块利用率，输出为可对比的指标表
+- [x] 引入 $O(1)$ 侵入式双向链表与三态 LRU 淘汰（CLEAN 优先 + CACHED LRU + 主动清理哈希表）
+- [x] 指标统计与 `bench/kvcache_bench.cpp` 对照基准（FIFO vs LRU vs Prefix Off）
 - [ ] 探索 Chunked Prefill / Token Budget（或 GPU ↔ CPU swap 对比）
 
 ## 声明

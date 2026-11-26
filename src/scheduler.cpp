@@ -296,6 +296,7 @@ void Scheduler::step()
     }
 
     // 阶段三：判断新请求是否该加入进来
+    const int cur_step = static_cast<int>(num_steps_.load());
     if(!preempted)
     {
         // 没发生抢占，说明空间还很多，可以加入新的请求
@@ -305,13 +306,23 @@ void Scheduler::step()
         while(!waiting_queue_.empty())
         {
             auto temp = waiting_queue_.front();
-            int block_needed = blocks_needed_for_prefill(temp);
-            if(block_needed + watermark > allocator->num_free_blocks()) break; // 判断进去后是否要抢占，要抢的话还不如不进
-            // 为什么不是continue呢，如果放过大的去塞小的，那么大的就一直轮不到了
+            // 只算一次 match_prefix，复用到 prefill() 避免重复哈希
+            // 注意：只有 ref_count > 0 的命中块不消耗 num_free_blocks()；
+            //       ref_count == 0 的 CACHED 空闲块被 inc_ref 复活后同样会从空闲链表摘除
+            auto match = manager_.match_prefix(temp->all_tokens);
+            int total = (static_cast<int>(temp->all_tokens.size()) + blk_size - 1) / blk_size;
+            int active_hit = 0;
+            for(int id : match.cached_blocks)
+            {
+                if(allocator->get_block(id).ref_count > 0) ++active_hit;
+            }
+            int block_needed = total - active_hit;
+            if(block_needed + watermark > allocator->num_free_blocks()) break; // 空间不足则停止准入，避免大请求饥饿
             // prefill新请求，加入running_queue_等待下一轮decode
-            bool ok = prefill(temp->all_tokens, *temp, manager_);
+            bool ok = prefill(temp->all_tokens, *temp, manager_, &match);
             assert(ok);
             temp->s = ReqState::RUNNING;
+            if(temp->admit_step < 0) temp->admit_step = cur_step;
             waiting_queue_.pop_front();
             running_queue_.push_back(temp);
             // 此时先不放入batch，因为没有进行新slot的计算，留着下一轮再decode
@@ -331,11 +342,13 @@ void Scheduler::step()
         for(int i = 0; i < (int)batch.size(); i++)
         {
             int new_token = new_tokens[i];
+            if(batch[i]->first_token_step < 0) batch[i]->first_token_step = cur_step;
             append_token(manager_, *batch[i], new_token);
             batch[i]->num_generated_tokens++;
 
             if(batch[i]->num_generated_tokens >= batch[i]->max_new_tokens)
             {
+                batch[i]->finish_step = cur_step;
                 batch[i]->s = ReqState::FINISHED;
                 manager_.release(*batch[i]); // 内部只用 alloc_mutex_，不冲突
 

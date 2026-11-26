@@ -13,7 +13,10 @@ int fake_sample(const Request& r)
 }
 
 // ====== 其他函数 ======
-bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManager& manager)
+// 注：若 prefill 中途因空间不足回滚，已分配阶段触发的缓存淘汰不会恢复；
+//     Scheduler 阶段三的准入预检保证不会在空间不足时调用 prefill。
+bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManager& manager,
+             const BlockManager::PrefixMatch* precomputed_match)
 {
     auto allocator = manager.get_allocator();
     const int blk_size = manager.block_size();
@@ -28,9 +31,13 @@ bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManag
     int block_nums = (N + blk_size - 1) / blk_size; // 需要的块数
     request.block_table.reserve(block_nums);
 
-    // 进行复用判断与界定
-    auto matched = manager.match_prefix(prompt_tokens);
+    // 复用调度器阶段三已算好的匹配结果，避免同一步内重复哈希与重复记账
+    BlockManager::PrefixMatch local_match;
+    const BlockManager::PrefixMatch& matched =
+        precomputed_match ? *precomputed_match : (local_match = manager.match_prefix(prompt_tokens));
     int matched_blocks_num = static_cast<int>(matched.cached_blocks.size());
+    int full_query_blocks = N / blk_size;
+    manager.record_prefill_stats(N, full_query_blocks, matched_blocks_num);
 
     // 先将复用块加入block_table，并inc_ref
     for(auto id : matched.cached_blocks)
@@ -41,8 +48,8 @@ bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManag
 
     for(int i = matched_blocks_num; i < block_nums; i++)
     {
-        int temp_id = allocator->allocate(); // 获取空闲物理块id
-        if(temp_id < 0)                      // 失败时回滚：复用块和新分配块都只释放本请求持有的引用
+        int temp_id = manager.allocate_block(); // 统一经 BlockManager 分配，确保淘汰同步清哈希
+        if(temp_id < 0)                         // 失败时回滚：复用块和新分配块都只释放本请求持有的引用
         {
             manager.release(request);
             return false;
@@ -79,7 +86,7 @@ int append_slot(BlockManager& manager, Request& request)
     // 情况A：需要新增块
     if(offset == 0)
     {
-        int new_block_id = allocator->allocate();
+        int new_block_id = manager.allocate_block();
         if(new_block_id < 0) return -1;
         request.block_table.push_back(new_block_id);
         slot_id = new_block_id * blk_size + offset;
@@ -97,12 +104,12 @@ int append_slot(BlockManager& manager, Request& request)
         // 情况C：不需要新增但处于共享状态，需要写时复制
         else
         {
-            int new_block_id = allocator->allocate();
+            int new_block_id = manager.allocate_block();
             if(new_block_id < 0) return -1;
             request.block_table[tail_block_logical_id] = new_block_id; // 尾块更新
 
-            // 拷贝原尾块内的有效token进新的块（当前为元信息模拟，仅计数不搬运真实 KV）
-            manager.record_cow_copy();
+            // 拷贝原尾块内的有效token进新的块（当前为元信息模拟，记录次数与搬运 token 数）
+            manager.record_cow_copy(offset);
             allocator->dec_ref(tail_block_physical_id);
             slot_id = new_block_id * blk_size + offset;
         }

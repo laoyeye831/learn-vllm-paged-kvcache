@@ -228,11 +228,28 @@ clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
 
 This is a study project; the following are **deliberate simplifications**, not bugs waiting to be fixed:
 
-- **No real KV data.** The copy-on-write branch of `append_slot()` only increments `BlockManager::num_cow_copies()`; no tensors are moved. Blocks carry metadata only.
-- **No LRU eviction.** `PhysicalBlock::last_accessed` is unused and `free_list_` is FIFO. Stale hash entries are caught by the `has_hash` / `hash` check instead of being evicted.
+- **No real KV data.** The copy-on-write branch of `append_slot()` only increments `BlockManager::num_cow_copies()` / `num_cow_tokens()`; no tensors are moved. Blocks carry metadata only.
 - **No CPU swap.** Preemption uses release-and-recompute (which requires `all_tokens.size() == sequence_length`, i.e. a replayable prompt). The `SWAPPED` state exists but is unused.
 - **Placeholder sampler.** `fake_sample()` is a deterministic hash so results can be compared token by token; no model is involved.
 - **No hash-collision fallback.** The 64-bit polynomial hash makes collisions vanishingly unlikely, but they are not otherwise guarded.
+
+## Benchmark (FIFO vs LRU vs Prefix Off)
+
+Run `./build/kvcache_bench --sweep` (`seed=42`, `block_size=16`, supports `--workload sysprompt|chat|zipf`, `--blocks N`, `--policy fifo|lru`, `--prefix on|off`, `--csv`):
+
+| workload | blocks | policy / prefix | hit% | evictions | revivals | preempt | steps | tok/step |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| `sysprompt` | 24 | `prefix off` | 0.0% | 0 | 0 | 1 | 510 | 2.24 |
+| `sysprompt` | 24 | `fifo` + prefix | 71.7% | 187 | 30 | 0 | 307 | 3.72 |
+| `sysprompt` | 24 | `lru` + prefix | **73.0%** | **178** | **36** | 0 | 307 | 3.72 |
+| `chat` | 64 | `prefix off` | 0.0% | 0 | 0 | 0 | 174 | 3.80 |
+| `chat` | 64 | `fifo` + prefix | 15.0% | 344 | 64 | 0 | 174 | 3.80 |
+| `chat` | 64 | `lru` + prefix | **17.6%** | **332** | **75** | 0 | 174 | 3.80 |
+| `zipf` | 32 | `prefix off` | 0.0% | 0 | 0 | 1 | 252 | 3.70 |
+| `zipf` | 32 | `fifo` + prefix | 51.1% | 207 | 28 | 0 | 250 | 3.73 |
+| `zipf` | 32 | `lru` + prefix | **53.3%** | **195** | **36** | 0 | 250 | 3.73 |
+| `zipf` | 48 | `fifo` + prefix | 61.1% | 158 | 64 | 0 | 250 | 3.73 |
+| `zipf` | 48 | `lru` + prefix | **64.4%** | **139** | **76** | 0 | 250 | 3.73 |
 
 ## Roadmap
 
@@ -243,8 +260,8 @@ This is a study project; the following are **deliberate simplifications**, not b
 - [x] Dynamic worker dispatch (shared atomic cursor) to remove tail idle time
 - [x] Runtime-configurable `block_size`, `watermark` (absolute or ratio), and `enable_prefix_caching`
 - [x] Zero-copy prefix hashing + O(1) incremental `register_block` and full `running_mutex_` lock coverage
-- [ ] O(1) LRU eviction of free blocks, replacing the FIFO free list
-- [ ] Report cache hit rate and block utilization as comparable metrics
+- [x] O(1) intrusive free list and 3-state LRU eviction (CLEAN-first + CACHED LRU + eager hash cleanup)
+- [x] Cache/eviction metrics and reproducible `bench/kvcache_bench.cpp` (FIFO vs LRU vs Prefix Off)
 - [ ] Explore Chunked Prefill / token budget (or GPU ↔ CPU swap comparison)
 
 ## Disclaimer

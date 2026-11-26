@@ -71,6 +71,6 @@ jobs:
           include/kvcache.h
           src/allocator.cpp src/manager.cpp src/other.cpp src/scheduler.cpp
           tests/test_util.h
-          tests/kvcache_phase1_3_test.cpp tests/scheduler_test.cpp
+          tests/kvcache_phase1_3_test.cpp tests/eviction_test.cpp tests/scheduler_test.cpp
           tests/scheduler_thread_test.cpp tests/random_pressure_test.cpp tests/thread_stress_test.cpp
-          examples/demo.cpp
+          examples/demo.cpp bench/kvcache_bench.cpp

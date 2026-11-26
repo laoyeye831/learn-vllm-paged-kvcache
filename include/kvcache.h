@@ -1,7 +1,6 @@
 #pragma once
 #include <vector>
 #include <unordered_map>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -44,14 +43,34 @@ enum class ReqState : int
     ABORTED      // 请求被中止
 };
 
+// 空闲块层级：在用为 NONE，空闲按是否带有前缀缓存分为 CLEAN 与 CACHED
+enum class FreeTier : uint8_t
+{
+    NONE = 0,
+    CLEAN,
+    CACHED
+};
+
+// 空闲链表淘汰策略
+enum class FreePolicy
+{
+    FIFO = 0, // 所有空闲块一律 push_back（旧版行为，用于对照实验）
+    LRU       // CLEAN 块 push_front 优先分配，CACHED 块 push_back 按释放时间 LRU 淘汰
+};
+
 // 物理块内容信息
 struct PhysicalBlock
 {
     int block_id;
     int ref_count{0};          // 引用计数，表示当前 block 被多少个 KV 使用
-    uint64_t last_accessed{0}; // 用于 LRU 淘汰/换出
+    uint64_t last_accessed{0}; // 分配/复活/归还为缓存块时的逻辑时钟戳
     uint64_t hash{0};          // 前缀缓存中该块对应的链式哈希
     bool has_hash{false};      // 该块当前是否登记在前缀缓存中（重新分配时清除）
+
+    // 侵入式双向链表指针（替代 std::list 节点，-1 表示无）
+    int free_prev{-1};
+    int free_next{-1};
+    FreeTier tier{FreeTier::NONE}; // 维护空闲层级计数与不变量检查
 
     bool is_full(int num_tokens, int block_size = DEFAULT_BLOCK_SIZE) const
     {
@@ -59,29 +78,65 @@ struct PhysicalBlock
     }
 };
 
-// 抽象出的单设备内存块分配器，负责物理块的分配、释放、引用计数管理等
+class BlockManager;
+
+// 抽象出的单设备内存块分配器，负责物理块的分配、释放、引用计数管理与 O(1) 空闲队列
 class BlockAllocator
 {
 public:
-    explicit BlockAllocator(int num_blocks, int block_size = DEFAULT_BLOCK_SIZE);
+    explicit BlockAllocator(int num_blocks, int block_size = DEFAULT_BLOCK_SIZE,
+                            FreePolicy policy = FreePolicy::LRU);
 
-    int allocate();
-    void free(int block_id);
-    void inc_ref(int block_id);
-    void dec_ref(int block_id);
+    void inc_ref(int block_id); // O(1) 摘链复活
+    void dec_ref(int block_id); // 归零时按 has_hash 路由到 CLEAN / CACHED
 
-    int num_free_blocks() const;
+    int num_free_blocks() const; // = num_clean_free_ + num_cached_free_
+    int num_free_clean() const;
+    int num_free_cached() const;
     int num_blocks() const;
     int block_size() const;
+    FreePolicy policy() const { return policy_; }
     PhysicalBlock& get_block(int block_id);
+    const PhysicalBlock& get_block(int block_id) const;
 
     // 只读检查接口，供测试 / 断言使用；不修改任何状态
     int ref_count_of(int block_id) const;
+    int free_head() const;
+    int free_tail() const;
+
+    // 分配器统计指标（锁内维护）
+    uint64_t num_allocations() const;
+    uint64_t num_evictions() const; // 分配到了 CACHED 块（= 淘汰一条缓存）
+    uint64_t num_revivals() const;  // inc_ref 把空闲缓存块复活
 
 private:
+    friend class BlockManager; // 仅允许 BlockManager 走“带淘汰语义”的分配，保证哈希表同步清理
+
+    struct AllocOutcome
+    {
+        int block_id{-1};
+        bool evicted{false};
+        uint64_t evicted_hash{0};
+    };
+
+    AllocOutcome allocate_ex();
+
+    void link_front_locked(int id);
+    void link_back_locked(int id);
+    void unlink_locked(int id);
+    void push_free_locked(int id);
+
     int block_size_{DEFAULT_BLOCK_SIZE};
+    FreePolicy policy_{FreePolicy::LRU};
     std::vector<PhysicalBlock> blocks_;
-    std::list<int> free_list_; // 采用双向链表便于 LRU 扩展
+    int free_head_{-1};
+    int free_tail_{-1};
+    int num_clean_free_{0};
+    int num_cached_free_{0};
+    uint64_t access_clock_{0};
+    uint64_t num_allocations_{0};
+    uint64_t num_evictions_{0};
+    uint64_t num_revivals_{0};
     mutable std::mutex alloc_mutex_;
 };
 
@@ -97,25 +152,40 @@ struct Request
     int arrival_id{0};              // 请求到达顺序编号
     int max_new_tokens{0};          // 该请求最多可生成的 token 数量（用于调度策略）
     int num_generated_tokens{0};    // 该请求已生成的 token 数量（用于调度策略）
+    int admit_step{-1};             // 首次被准入的步号（抢占重入不覆盖）
+    int first_token_step{-1};       // 产出第一个 token 的步号
+    int finish_step{-1};            // 完成步号
 };
 
 // LLMtoken生成模拟器
 int fake_sample(const Request& r);
 
 
-// 抽象出单设备内存块管理器，负责 KV 缓存的注册、匹配、释放等操作
+// 抽象出单设备内存块管理器，负责 KV 缓存的分配、注册、匹配、淘汰清理与释放
 class BlockManager
 {
 private:
     BlockAllocator* allocator_;
     BlockManagerConfig config_;
     std::unordered_map<uint64_t, int> hash_to_block_;
-    std::atomic<long long> num_cow_copies_{0}; // 累计写时复制次数
-    //+LRU 相关数据结构
+
+    // 以下指标由调度线程更新，供 step_hook 或 stop() 后读取
+    uint64_t prefix_cache_queries_{0}; // 实际 prefill 查询的满块数
+    uint64_t prefix_cache_hits_{0};    // 实际 prefill 命中的满块数
+    uint64_t prompt_tokens_{0};        // 实际 prefill 的 token 数（含抢占重算）
+    uint64_t num_registrations_{0};    // 新登记进哈希表的块数
+    uint64_t num_cow_copies_{0};       // 累计写时复制次数
+    uint64_t num_cow_tokens_{0};       // 累计写时复制搬运的 token 数
+
+    void evict_hash_entry(int block_id, uint64_t hash);
 
 public:
     explicit BlockManager(BlockAllocator* allocator, BlockManagerConfig config = {});
-    // 新请求进来时调用（只查询，不修改引用计数）
+
+    // 物理块分配唯一出口：若触发淘汰，同步清理 hash_to_block_ 中对应条目
+    int allocate_block();
+
+    // 新请求进来时调用（只查询，不修改引用计数，也不计入 prefill 指标）
     // 返回：命中缓存的物理块列表 + 命中的 token 数
     struct PrefixMatch
     {
@@ -130,11 +200,24 @@ public:
     // 释放请求
     void release(Request& req);
 
+    // 记录一次真实 prefill 的前缀缓存查询/命中与 token 统计
+    void record_prefill_stats(int prompt_token_count, int query_blocks, int hit_blocks);
+
+    // 记录一次 CoW（含需拷贝的槽位数 offset）
+    void record_cow_copy(int copied_tokens = 0);
+
     BlockAllocator* get_allocator();
+    const BlockAllocator* get_allocator() const;
     int block_size() const;
     bool prefix_caching_enabled() const { return config_.enable_prefix_caching; }
-    long long num_cow_copies() const { return num_cow_copies_.load(); }
-    void record_cow_copy() { num_cow_copies_.fetch_add(1, std::memory_order_relaxed); }
+    size_t num_hash_entries() const { return hash_to_block_.size(); }
+
+    uint64_t prefix_cache_queries() const { return prefix_cache_queries_; }
+    uint64_t prefix_cache_hits() const { return prefix_cache_hits_; }
+    uint64_t prompt_tokens() const { return prompt_tokens_; }
+    uint64_t num_registrations() const { return num_registrations_; }
+    uint64_t num_cow_copies() const { return num_cow_copies_; }
+    uint64_t num_cow_tokens() const { return num_cow_tokens_; }
 };
 
 // 抽象出单设备调度策略，负责请求的调度、抢占、换出等操作
@@ -253,7 +336,8 @@ public:
     }
 };
 
-bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManager& manager);
+bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManager& manager,
+             const BlockManager::PrefixMatch* precomputed_match = nullptr);
 
 int append_slot(BlockManager& manager, Request& request);
 
