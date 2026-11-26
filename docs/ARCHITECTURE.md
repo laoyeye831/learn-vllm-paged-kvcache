@@ -184,7 +184,7 @@ head                                                                    tail
 
 ```mermaid
 flowchart LR
-    P1["生产者线程 1<br/>add_request"] --> IN["inbox_<br/>sched_mutex_"]
+    P1["生产者线程 1<br/>add_request"] --> IN["inbox_<br/>state_mutex_"]
     P2["生产者线程 N<br/>add_request"] --> IN
     IN --> ST["调度线程<br/>run() → step()"]
     ST --> POOL["Worker 池<br/>pool_mutex_ / task_cv_ / done_cv_"]
@@ -197,9 +197,7 @@ flowchart LR
 
 | 互斥量 | 保护对象 | 备注 |
 |---|---|---|
-| `sched_mutex_` | `inbox_`、`next_arrival_id_`、`stop_flag_`、`sched_cv_` | `add_request` 与阶段一竞争 |
-| `pending_mutex_` | `pending_`（`arrival_id → promise`） | 与 `sched_mutex_` 成对获取，顺序固定 |
-| `waiting_mutex_` / `running_mutex_` | 两个队列的**观察**（`waiting()` / `running()`） | `mutable`，供 const 只读访问器加锁 |
+| `state_mutex_` | `inbox_`、`waiting_queue_`、`running_queue_`、`pending_`、`next_arrival_id_` | 唯一的队列锁；`mutable`，供 const 只读访问器加锁 |
 | `step_mutex_` | 整个 `step()` | 保证同一时刻只有一个推进者（调度线程 或 测试的 `step()`） |
 | `pool_mutex_` | 池状态：`round_`、`remaining_`、`cur_*`、`worker_error_` | 派活与收工都靠它 + 两个条件变量 |
 | `task_cv_` / `done_cv_` | 派活 / 收工的等待点 | `round_` 翻牌机制取代「队列 + 哨兵」 |
@@ -208,7 +206,7 @@ flowchart LR
 
 ### 三条铁律
 
-1. **多把锁的获取顺序固定**：`sched_mutex_` → `pending_mutex_` → `running_mutex_` → `waiting_mutex_` → `alloc_mutex_`，任何地方都不反向（包括 `step()` 阶段二/三与 `abort_all_pending()`）。
+1. **队列只有一把锁**：所有队列与 `pending_` 共用 `state_mutex_`，且它只在 `step_mutex_` 之内获取（`step_mutex_` → `state_mutex_` → `alloc_mutex_`），不存在反向路径，因此不可能出现锁序成环。
 2. **promise 只在锁外 `set_value()`**：被唤醒的调用方可能立刻回头调 `add_request()`，若在锁内兑现就会自己堵自己（Day 6 的踩坑记录）。
 3. **运行中不可替换回调**：`set_sampler()` / `set_step_hook()` 用 `assert(!started_)` 拦住，因为 Worker 会并发只读这两个 `std::function`。
 

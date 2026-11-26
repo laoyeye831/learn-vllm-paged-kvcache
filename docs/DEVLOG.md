@@ -145,3 +145,23 @@
 - **抢占前置条件修复**：旧版 `preempt()` 断言 `all_tokens.size() == sequence_length`，上线 chunked prefill 后“prefill 到一半”的请求成为常态，该断言必然崩溃。改为断言 `num_computed_tokens <= all_tokens.size()`，抢占时释放物理块并清零 `num_computed_tokens`，已写满登记的块留在 `CACHED` 链表中，恢复时自动通过 `match_prefix()` 续算。
 - **防止 `waiting` 队列饥饿**：遵循 vLLM 的 running-first 原则，同时把 `max_num_seqs` 与 `max_num_batched_tokens` 分开控制，并增加可选的 `waiting_token_reserve`（钳制在 `max_num_batched_tokens - 1` 以内，保证 running 队列每步至少推进 1 token 不会死锁）。
 - **ITL 模拟基准**：利用 `Scheduler::last_step_scheduled_tokens()` 驱动确定性 step-cost 时钟（`5ms + 0.25ms * tokens`），在 `mixed` 长短混合负载下验证：`budget=128` 时 ITL p99 从 `139.5ms` 降至 `37.0ms`（**-73.5%**），TTFT 仅增 `1.7ms`，吞吐保持在 `99.3%`。
+
+---
+
+## Day 10（v0.4.1）
+
+**目标**：修复 v0.4.0 引入的 TSan 报错（`lock-order-inversion`），让 `Linux / ThreadSanitizer` 任务重新变绿。
+
+**产出**：`Scheduler` 的四把队列锁合并为单把 `state_mutex_`，CI 全绿。
+
+**遇到的坑**：
+
+- **报错本身很反常**：TSan 指认的两条环边都落在 `schedule_locked()` 阶段一的同一处代码（`sched_mutex_` → `pending_mutex_` → `waiting_mutex_`），而它们明明是同一个方向获取的，字面上不可能成环。
+- **本地 GCC 11 复现不出来**，GCC 15 才报。换 clang（zig 自带 LLVM 18）后一次复现，并打印互斥量地址才确认：报错环是 `sched_mutex_`（`0x…d2b8`）与 `waiting_mutex_`（`0x…d308`），但 TSan 记录的“先前获取点”指向 `schedule()` 里的 `step_mutex_`——同一个调用点被算成了不同互斥量。
+
+**根因**：`std::mutex` 在 libstdc++ / libc++ 里是「静态初始化 + 平凡析构」，不会调用 `pthread_mutex_init/destroy`。TSan 只能按地址记账，于是**不同测试里栈上先后出现的不同 `Scheduler` 实例**，只要某个成员互斥量恰好落在同一地址，就会被当成同一把锁，把两个各自合法的边拼成一个不存在的环。细粒度锁越多，这种地址别名命中率越高。
+
+**决策**：不靠「全局锁顺序」的纪律，直接把队列锁从 4 把收敛成 1 把（`state_mutex_`）。合并后 `step_mutex_ → state_mutex_ → alloc_mutex_` 是唯一路径，不存在反向边；即使 TSan 把不同实例的锁按地址混为一谈，`state_mutex_` 撞上的也只是另一把 `state_mutex_`，自环不会报警。顺带把 `preempt()` / `add_request()` / `abort_all_pending()` 的嵌套解锁全部摊平成一次加锁，读起来也更直白。
+
+**验证**：Windows/MSVC 与 WSL GCC 全量 7 个用例通过；WSL clang + TSan 重编 6 个测试二进制，`lock-order-inversion` 告警数为 0（改造前 `scheduler_test` 稳定复现并 `rc=66` 退出）。
+

@@ -52,7 +52,7 @@ void Scheduler::set_sampler(std::function<int(const Request&)> sampler)
 {
     // 采样器只允许在启动前设置：Worker 会并发只读 sample_func_，运行中替换是数据竞争
     assert(!started_.load() && "set_sampler() must be called before start()");
-    std::lock_guard<std::mutex> lock(sched_mutex_);
+    std::lock_guard<std::mutex> lock(state_mutex_);
     sample_func_ = std::move(sampler);
 }
 
@@ -60,7 +60,7 @@ void Scheduler::set_step_hook(std::function<void(const Scheduler&)> hook)
 {
     // 回调在调度线程里执行，运行中被替换同样是数据竞争
     assert(!started_.load() && "set_step_hook() must be called before start()");
-    std::lock_guard<std::mutex> lock(sched_mutex_);
+    std::lock_guard<std::mutex> lock(state_mutex_);
     step_hook_ = std::move(hook);
 }
 
@@ -76,13 +76,11 @@ std::future<void> Scheduler::add_request(std::shared_ptr<Request> req)
         return f;
     }
 
-    // 对inbox_和pending_操作，加锁
-    std::unique_lock<std::mutex> lock1(sched_mutex_);
-    std::unique_lock<std::mutex> lock2(pending_mutex_);
+    // 对 inbox_ / pending_ 的操作共用 state_mutex_
+    std::unique_lock<std::mutex> lock(state_mutex_);
     if(stop_flag_.load()) // 拿锁期间可能刚好被 stop
     {
-        lock2.unlock();
-        lock1.unlock();
+        lock.unlock();
         req->s = ReqState::ABORTED;
         std::promise<void> p;
         auto f = p.get_future();
@@ -278,9 +276,7 @@ SchedulerOutput Scheduler::schedule_locked()
     // 阶段一：先清空收件箱进入 waiting_queue_
     // 本步内准入拒绝的 promise 放入 output.aborted_promises，统一由 execute_locked 在 step_hook_ 之后锁外唤醒
     {
-        std::unique_lock<std::mutex> lock(sched_mutex_);     // 对inbox_操作（与add_request竞争）
-        std::unique_lock<std::mutex> lock_p(pending_mutex_); // 对pending_操作
-        std::unique_lock<std::mutex> lock_w(waiting_mutex_); // 对waiting_queue_操作（与waiting()竞争）
+        std::unique_lock<std::mutex> lock(state_mutex_); // inbox_ / pending_ / waiting_queue_
         while(!inbox_.empty())
         {
             auto temp = inbox_.begin();
@@ -304,10 +300,8 @@ SchedulerOutput Scheduler::schedule_locked()
     int remaining_budget = chunked ? config_.max_num_batched_tokens : INT_MAX;
 
     // 阶段二：running 优先（处理正在 decode 或续算 chunked prefill 的请求，必要时抢占队尾）
-    // 严格遵守全局锁顺序：running_mutex_ -> waiting_mutex_
     {
-        std::unique_lock<std::mutex> lock_r(running_mutex_);
-        std::unique_lock<std::mutex> lock_w(waiting_mutex_);
+        std::unique_lock<std::mutex> lock(state_mutex_);
 
         // 若配置了 waiting_token_reserve 且 waiting 队列有资格准入，为新请求保留一小份预算防饥饿
         int reserve = 0;
@@ -388,8 +382,7 @@ SchedulerOutput Scheduler::schedule_locked()
     // 阶段三：准入新请求（仅在阶段二未发生抢占时执行，同时受 max_num_seqs 与 token budget 约束）
     if(!output.preempted)
     {
-        std::unique_lock<std::mutex> lock_r(running_mutex_);
-        std::unique_lock<std::mutex> lock_w(waiting_mutex_);
+        std::unique_lock<std::mutex> lock(state_mutex_);
         while(!waiting_queue_.empty())
         {
             if(config_.max_num_seqs > 0 && static_cast<int>(running_queue_.size()) >= config_.max_num_seqs)
@@ -451,8 +444,7 @@ void Scheduler::execute_locked(SchedulerOutput& output)
     output.aborted_promises.clear();
 
     {
-        std::unique_lock<std::mutex> lock_p(pending_mutex_); // 保护 pending_
-        std::unique_lock<std::mutex> lock_r(running_mutex_); // 保护 running_queue_
+        std::unique_lock<std::mutex> lock(state_mutex_); // pending_ 与 running_queue_
 
         for(int i = 0; i < static_cast<int>(output.decode_reqs.size()); i++)
         {
@@ -477,7 +469,7 @@ void Scheduler::execute_locked(SchedulerOutput& output)
             }
         }
     }
-    // 两把锁在这里析构释放
+    // state_mutex_ 在这里析构释放
 
     last_step_prefill_tokens_.store(output.num_prefill_tokens, std::memory_order_relaxed);
     last_step_decode_tokens_.store(output.num_decode_tokens, std::memory_order_relaxed);
@@ -500,11 +492,11 @@ void Scheduler::run()
     while(true)
     {
         {
-            std::unique_lock<std::mutex> lk(sched_mutex_);
+            std::unique_lock<std::mutex> lk(state_mutex_);
             sched_cv_.wait(lk, [&]
                            { return stop_flag_.load() || unfinished.load() > 0; });
             if(stop_flag_.load()) break;
-        } // 释放 sched_mutex_，因为 step 的阶段一要用
+        } // 释放 state_mutex_，因为 step 的阶段一要用
         step();
     }
     // 停机后不再有线程修改队列/pending_，统一清理
@@ -559,7 +551,7 @@ void Scheduler::start()
 void Scheduler::stop(bool drain)
 {
     {
-        std::unique_lock<std::mutex> lk(sched_mutex_);
+        std::unique_lock<std::mutex> lk(state_mutex_);
         if(!stop_flag_.load())
         {
             if(drain && sched_thread_.joinable())
@@ -593,10 +585,7 @@ void Scheduler::abort_all_pending()
 {
     std::vector<PendingCompletion> to_fire;
     {
-        std::unique_lock<std::mutex> lock1(sched_mutex_);
-        std::unique_lock<std::mutex> lock2(pending_mutex_);
-        std::unique_lock<std::mutex> lock_r(running_mutex_);
-        std::unique_lock<std::mutex> lock_w(waiting_mutex_);
+        std::unique_lock<std::mutex> lock(state_mutex_);
 
         for(auto& req : running_queue_)
         {

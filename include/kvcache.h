@@ -261,18 +261,19 @@ private:
     std::deque<std::shared_ptr<Request>> inbox_;         // 收件箱（加锁）
     std::deque<std::shared_ptr<Request>> waiting_queue_; // 等待队列
     std::deque<std::shared_ptr<Request>> running_queue_; // 运行队列
-    std::mutex sched_mutex_;                             // 调度器互斥锁（inbox_ + next_arrival_id_）
-    std::mutex pending_mutex_;                           // promise操作互斥锁
-    mutable std::mutex waiting_mutex_;                   // 等待队列互斥锁
-    mutable std::mutex running_mutex_;                   // 运行队列互斥锁
-    std::mutex step_mutex_;                              // 保证同一时刻只有一个线程在 step()
-    std::condition_variable sched_cv_;                   // 调度器条件变量
-    std::atomic<bool> stop_flag_{false};                 // 停止标志
-    std::thread sched_thread_;                           // run() 所在的线程
-    int next_arrival_id_{0};                             // 下一个请求的到达顺序编号
-    std::atomic<int> num_preemptions_{0};                // 累计抢占次数
-    std::function<int(const Request&)> sample_func_;     // token 采样器函数，外部设置，内部调用
-    std::function<void(const Scheduler&)> step_hook_;    // 每次 step() 结束后在调度线程调用（调试/不变量检查用）
+    // 唯一的调度状态锁：inbox_ / waiting_queue_ / running_queue_ / pending_ 全部由它保护。
+    // 刻意只用一把锁而不是四把：多把队列锁必须靠"全局获取顺序"来避免死锁，
+    // 而那种顺序约束一旦被破坏就只能在运行时暴露。合并后，任何时刻最多持有这一把队列锁，
+    // step_mutex_ 永远在它外层，锁顺序问题从设计上消失。
+    mutable std::mutex state_mutex_;
+    std::mutex step_mutex_;                           // 保证同一时刻只有一个线程在 step()
+    std::condition_variable sched_cv_;                // 调度器条件变量
+    std::atomic<bool> stop_flag_{false};              // 停止标志
+    std::thread sched_thread_;                        // run() 所在的线程
+    int next_arrival_id_{0};                          // 下一个请求的到达顺序编号
+    std::atomic<int> num_preemptions_{0};             // 累计抢占次数
+    std::function<int(const Request&)> sample_func_;  // token 采样器函数，外部设置，内部调用
+    std::function<void(const Scheduler&)> step_hook_; // 每次 step() 结束后在调度线程调用（调试/不变量检查用）
     struct PendingCompletion
     {
         std::promise<void> done;
@@ -299,7 +300,7 @@ private:
     std::atomic<bool> workers_stop_{false};
     std::atomic<bool> started_{false}; // start() 是否已调用（采样器不允许之后再改）
 
-    // 抢占一个请求（调用方需已持有 running_mutex_ -> waiting_mutex_）
+    // 抢占一个请求（调用方需已持有 state_mutex_）
     void preempt();
 
     // 两阶段内部实现（调用方需已持有 step_mutex_）
@@ -373,12 +374,12 @@ public:
     // 只读访问器，供测试观察调度状态
     const std::deque<std::shared_ptr<Request>> running() const
     {
-        std::lock_guard<std::mutex> lock(running_mutex_);
+        std::lock_guard<std::mutex> lock(state_mutex_);
         return running_queue_;
     }
     const std::deque<std::shared_ptr<Request>> waiting() const
     {
-        std::lock_guard<std::mutex> lock(waiting_mutex_);
+        std::lock_guard<std::mutex> lock(state_mutex_);
         return waiting_queue_;
     }
 };
