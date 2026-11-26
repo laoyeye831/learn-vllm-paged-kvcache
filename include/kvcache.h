@@ -31,14 +31,17 @@ struct SchedulerConfig
     int num_workers{1};                       // Worker 采样线程数
     int watermark_blocks{DEFAULT_WATER_MARK}; // 安全水位（绝对块数）；watermark_ratio >= 0 时忽略
     double watermark_ratio{-1.0};             // 安全水位比例（如 0.01）；< 0 表示使用 watermark_blocks
+    int max_num_batched_tokens{0};            // 单步 token 预算（<= 0 表示不限制）
+    int max_num_seqs{0};                      // 同时运行请求数上限（<= 0 表示不限制）
+    bool enable_chunked_prefill{true};        // 是否启用分块预填充（仅在 max_num_batched_tokens > 0 时生效）
+    int waiting_token_reserve{0};             // 可选：为 waiting 队列预留的最小 token 预算，防止饥饿
 };
 
-// 状态枚举
+// 状态枚举（已移除 SWAPPED，遵循 vLLM v1 仅保留 Recompute 路径）
 enum class ReqState : int
 {
     WAITING = 0, // 等待/被抢占
-    RUNNING,     // 块在GPU
-    SWAPPED,     // 块在CPU
+    RUNNING,     // 块在显存中
     FINISHED,    // 请求已完成
     ABORTED      // 请求被中止
 };
@@ -144,9 +147,10 @@ private:
 struct Request
 {
     std::vector<int> block_table;   // 逻辑块到物理块的映射表
-    int sequence_length{0};         // 请求的序列长度
+    int sequence_length{0};         // 请求已落盘 KV 的序列长度（与 num_computed_tokens 同步）
+    int num_computed_tokens{0};     // 已完成 prefill/decode KV 计算的 token 数（支持分块预填充续算）
     std::vector<int> slot_mapping;  // 逻辑槽位到物理块的映射表
-    std::vector<int> all_tokens;    // 存储tokens
+    std::vector<int> all_tokens;    // 存储tokens（完整 prompt + 已生成的 token）
     int num_cached_blocks{0};       // block_table 开头已命中/已注册进前缀缓存的块数
     ReqState s = ReqState::WAITING; // 请求状态
     int arrival_id{0};              // 请求到达顺序编号
@@ -155,6 +159,11 @@ struct Request
     int admit_step{-1};             // 首次被准入的步号（抢占重入不覆盖）
     int first_token_step{-1};       // 产出第一个 token 的步号
     int finish_step{-1};            // 完成步号
+
+    bool is_prefill_done() const
+    {
+        return num_computed_tokens >= static_cast<int>(all_tokens.size());
+    }
 };
 
 // LLMtoken生成模拟器
@@ -220,7 +229,31 @@ public:
     uint64_t num_cow_tokens() const { return num_cow_tokens_; }
 };
 
-// 抽象出单设备调度策略，负责请求的调度、抢占、换出等操作
+// 单步调度决策输出：解耦 Scheduler::schedule()（决策）与 Scheduler::execute()（执行）
+struct SchedulerOutput
+{
+    struct ScheduledPrefill
+    {
+        std::shared_ptr<Request> req;
+        int num_cached_tokens{0};   // 本步前缀缓存复用的 token 数
+        int num_computed_tokens{0}; // 本步实际计算的 prefill token 数（含分块）
+        bool is_new_admission{false};
+    };
+
+    std::vector<ScheduledPrefill> prefill_reqs;        // 本步执行 prefill / chunked prefill 的请求
+    std::vector<std::shared_ptr<Request>> decode_reqs; // 本步执行 decode 采样的请求
+    std::vector<std::promise<void>> aborted_promises;  // 阶段一准入拒绝的 promise（由 execute 锁外兑现）
+
+    int num_prefill_tokens{0}; // 本步实际计算的 prefill token 总数
+    int num_decode_tokens{0};  // 本步 decode token 总数（= decode_reqs.size()）
+    int num_preemptions{0};    // 本步发生的抢占次数
+    bool preempted{false};
+
+    int total_scheduled_tokens() const { return num_prefill_tokens + num_decode_tokens; }
+    bool empty() const { return prefill_reqs.empty() && decode_reqs.empty() && aborted_promises.empty(); }
+};
+
+// 抽象出单设备调度策略，负责请求的调度、抢占与两阶段执行（schedule + execute）
 class Scheduler
 {
 private:
@@ -247,6 +280,8 @@ private:
     std::unordered_map<int, PendingCompletion> pending_; // key = arrival_id
     std::atomic<int> unfinished{0};
     std::atomic<long long> num_steps_{0};                             // 已执行的 step() 次数（调试用）
+    std::atomic<int> last_step_prefill_tokens_{0};                    // 最近一步计算的 prefill token 数
+    std::atomic<int> last_step_decode_tokens_{0};                     // 最近一步计算的 decode token 数
     std::vector<std::thread> workers_;                                // Worker 线程池（只负责采样）
     std::mutex pool_mutex_;                                           // 保护下面所有池状态
     std::condition_variable task_cv_;                                 // 派活：主线程通知 Worker 开始新一轮
@@ -264,8 +299,12 @@ private:
     std::atomic<bool> workers_stop_{false};
     std::atomic<bool> started_{false}; // start() 是否已调用（采样器不允许之后再改）
 
-    // 抢占一个请求
+    // 抢占一个请求（调用方需已持有 running_mutex_ -> waiting_mutex_）
     void preempt();
+
+    // 两阶段内部实现（调用方需已持有 step_mutex_）
+    SchedulerOutput schedule_locked();
+    void execute_locked(SchedulerOutput& output);
 
     // 立刻中止所有未完成的请求：释放块、标记 ABORTED、唤醒等待者
     void abort_all_pending();
@@ -303,6 +342,11 @@ public:
     // 返回前会 join 后台线程，此后 pending_ 一定为空
     void stop(bool drain = true);
 
+    // 两阶段调度接口：schedule() 产出决策，execute() 执行采样与后处理
+    SchedulerOutput schedule();
+    void execute(SchedulerOutput& output);
+
+    // 单步驱动：等价于在同一 step_mutex_ 下执行 schedule() + execute()
     void step();
 
     void start(); // 内部持有线程，调用 run()，外部无需调用
@@ -319,6 +363,9 @@ public:
 
     int num_preemptions() const { return num_preemptions_; }
     long long num_steps() const { return num_steps_; }
+    int last_step_prefill_tokens() const { return last_step_prefill_tokens_.load(); }
+    int last_step_decode_tokens() const { return last_step_decode_tokens_.load(); }
+    int last_step_scheduled_tokens() const { return last_step_prefill_tokens_.load() + last_step_decode_tokens_.load(); }
 
     void worker_loop(int id);
     void sample_batch_parallel(const std::vector<std::shared_ptr<Request>>& batch, std::vector<int>& out);
@@ -338,6 +385,13 @@ public:
 
 bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManager& manager,
              const BlockManager::PrefixMatch* precomputed_match = nullptr);
+
+// 分块预填充原语：从 request.num_computed_tokens 处继续推进最多 num_new_tokens 个未缓存 token
+// 首次调用（num_computed_tokens == 0）会先复用前缀缓存块，再按块分配并推进 chunk；
+// 续算调用（num_computed_tokens > 0）仅追加本次 chunk 所需的新物理块并增量注册满块。
+bool prefill_chunk(Request& request, int num_new_tokens, BlockManager& manager,
+                   const BlockManager::PrefixMatch* precomputed_match = nullptr,
+                   int* out_cached_tokens = nullptr, int* out_computed_tokens = nullptr);
 
 int append_slot(BlockManager& manager, Request& request);
 

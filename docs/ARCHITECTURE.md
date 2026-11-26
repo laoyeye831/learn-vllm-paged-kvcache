@@ -76,9 +76,10 @@ struct PhysicalBlock {
 | `block_table` | 逻辑块号 → 物理块号 |
 | `slot_mapping` | 本步要写入的物理槽号（**每步重置，只含当前 token**，不是历史累积） |
 | `all_tokens` | prompt + 已生成的 token，用于重算与哈希 |
-| `sequence_length` | 当前序列长度（被抢占后由 `release()` 清零，再 `prefill()` 重建） |
+| `sequence_length` | 当前已落盘 KV 的序列长度（与 `num_computed_tokens` 同步；被抢占后由 `release()` 清零） |
+| `num_computed_tokens` | 已完成 prefill/decode KV 计算的 token 数；`< all_tokens.size()` 表示处于分块预填充中途 |
 | `num_cached_blocks` | `block_table` 开头已命中 / 已注册进缓存的块数 |
-| `s` | `WAITING` / `RUNNING` / `SWAPPED` / `FINISHED` / `ABORTED` |
+| `s` | `WAITING` / `RUNNING` / `FINISHED` / `ABORTED`（v0.4.0 已移除未使用的 `SWAPPED`） |
 | `max_new_tokens` / `num_generated_tokens` | 生成长度预算与实际进度（调度与终止条件） |
 
 > `slot_mapping` 的语义在 Day 1 曾走过弯路（见 [DEVLOG](DEVLOG.md)）：它表示「**这一步**要写哪几个物理槽」，因此 `append_slot()` 每次都先 `clear()` 再压入唯一的槽号。
@@ -126,14 +127,16 @@ sequenceDiagram
     S-->>U: future 就绪
 ```
 
-### `step()` 的四阶段
+### `step()` 的两阶段解耦（`schedule()` → `SchedulerOutput` → `execute()`）
 
-| 阶段 | 动作 | 关键点 |
-|---|---|---|
-| ① 准入 | `inbox_` → `waiting_queue_` | 用 `ceil((N+max_new)/BLOCK_SIZE) > num_blocks - WATER_MARK` 直接判死，避免一个永远跑不完的请求把队列堵死；被拒的请求标 `ABORTED` 并立刻兑现 future |
-| ② 抢占 | 遍历 `running_queue_` | `while(!can_append(req)) preempt()`；`preempt()` 抢占**队尾**（最晚到达的请求），释放块后 `push_front` 到等待队列，下次优先恢复 |
-| ③ 准入新请求 | `waiting_queue_` → `running_queue_` | **仅在阶段二没有发生抢占时执行**；空间不够就 `break` 而非 `continue` |
-| ④ 批量执行 | 采样 + 追加 token | 采样不持任何锁；`append_token` 在锁内完成；`FINISHED` 的请求 `release()` 块并兑现 future |
+v0.4.0 将原来的单体 `step()` 拆分为 `schedule()`（决策）与 `execute(SchedulerOutput&)`（执行）两个公开阶段，`step()` 在同一把 `step_mutex_` 下顺序调用二者：
+
+| 阶段 | 所属函数 | 动作 | 关键点 |
+|---|---|---|---|
+| ① 准入 | `schedule()` | `inbox_` → `waiting_queue_` | `ceil((N+max_new)/block_size) > num_blocks - watermark` 直接判死；被拒请求标 `ABORTED` 并把 promise 存入 `output.aborted_promises` |
+| ② 运行优先（Decode + 分块续算） | `schedule()` | 遍历 `running_queue_` | **running 优先**：若 `!req->is_prefill_done()` 则推进 `prefill_chunk` 续算，否则 `append_slot` 加入 `decode_reqs`；空间不足时抢占队尾（允许抢占 prefill 到一半的请求，释放块并清零 `num_computed_tokens`，已登记满块仍留在 `CACHED` 链中待续算复用） |
+| ③ 准入新请求 | `schedule()` | `waiting_queue_` → `running_queue_` | 仅在未抢占时执行，同时受 `max_num_seqs`、剩余 `token_budget` 与块水位约束；支持 `waiting_token_reserve` 为等待队列预留最小预算防饥饿 |
+| ④ 执行与后处理 | `execute()` | 采样 + 追加 token + 通知 | 锁外并行采样 `decode_reqs`；`append_token` 并释放 `FINISHED` 请求；更新 `last_step_*_tokens` → `step_hook_` → 锁外兑现全部 promise |
 
 两个「反直觉」的设计值得单独说明：
 
@@ -266,6 +269,6 @@ stateDiagram-v2
 | 简化 | 影响 |
 |---|---|
 | KV 内容是整数模拟，CoW 仅计数不搬运 | 无法测量真实拷贝开销 |
-| 抢占只做「释放 + 重算」，无 `SWAPPED` | `ReqState::SWAPPED` 目前是死枚举 |
+| 抢占仅保留「释放 + 重算」（已移除 `SWAPPED`） | 与 vLLM v1 一致，不做 CPU 换出 |
 
 完整清单见 README 的「已知限制」一节。

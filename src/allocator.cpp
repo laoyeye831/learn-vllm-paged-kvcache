@@ -213,34 +213,3 @@ uint64_t BlockAllocator::num_revivals() const
     std::lock_guard<std::mutex> lock(alloc_mutex_);
     return num_revivals_;
 }
-
-
-int BlockAllocator::free_head() const
-{
-    std::lock_guard<std::mutex> lock(alloc_mutex_);
-    return free_head_;
-}
-
-int BlockAllocator::free_tail() const
-{
-    std::lock_guard<std::mutex> lock(alloc_mutex_);
-    return free_tail_;
-}
-
-uint64_t BlockAllocator::num_allocations() const
-{
-    std::lock_guard<std::mutex> lock(alloc_mutex_);
-    return num_allocations_;
-}
-
-uint64_t BlockAllocator::num_evictions() const
-{
-    std::lock_guard<std::mutex> lock(alloc_mutex_);
-    return num_evictions_;
-}
-
-uint64_t BlockAllocator::num_revivals() const
-{
-    std::lock_guard<std::mutex> lock(alloc_mutex_);
-    return num_revivals_;
-}

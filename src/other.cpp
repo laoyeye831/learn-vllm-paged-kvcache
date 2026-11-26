@@ -67,10 +67,132 @@ bool prefill(const std::vector<int>& prompt_tokens, Request& request, BlockManag
         request.slot_mapping.push_back(slot_id);
     }
     request.sequence_length = N;
+    request.num_computed_tokens = N;
     request.num_cached_blocks = matched_blocks_num;
 
     // 把未命中的满块注册进缓存
     manager.register_block(request, matched_blocks_num);
+    return true;
+}
+
+bool prefill_chunk(Request& request, int num_new_tokens, BlockManager& manager,
+                   const BlockManager::PrefixMatch* precomputed_match,
+                   int* out_cached_tokens, int* out_computed_tokens)
+{
+    auto allocator = manager.get_allocator();
+    const int blk_size = manager.block_size();
+    const int total_tokens = static_cast<int>(request.all_tokens.size());
+    if(out_cached_tokens) *out_cached_tokens = 0;
+    if(out_computed_tokens) *out_computed_tokens = 0;
+
+    if(total_tokens == 0) return true;
+
+    // 情况 1：首次分块（num_computed_tokens == 0），先做前缀缓存匹配与复用
+    if(request.num_computed_tokens == 0)
+    {
+        manager.release(request);
+
+        BlockManager::PrefixMatch local_match;
+        const BlockManager::PrefixMatch& matched =
+            precomputed_match ? *precomputed_match : (local_match = manager.match_prefix(request.all_tokens));
+        const int matched_blocks_num = static_cast<int>(matched.cached_blocks.size());
+        const int cached_tokens = matched.num_matched_tokens;
+        const int uncached_tokens = std::max(0, total_tokens - cached_tokens);
+        const int chunk_new = (num_new_tokens > 0) ? std::min(uncached_tokens, num_new_tokens) : uncached_tokens;
+        const int new_len = cached_tokens + chunk_new;
+        const int target_blocks = (new_len + blk_size - 1) / blk_size;
+
+        manager.record_prefill_stats(total_tokens, total_tokens / blk_size, matched_blocks_num);
+
+        request.block_table.reserve(target_blocks);
+        for(int id : matched.cached_blocks)
+        {
+            allocator->inc_ref(id);
+            request.block_table.push_back(id);
+        }
+        for(int i = matched_blocks_num; i < target_blocks; ++i)
+        {
+            int new_id = manager.allocate_block();
+            if(new_id < 0)
+            {
+                manager.release(request);
+                return false;
+            }
+            request.block_table.push_back(new_id);
+        }
+
+        request.slot_mapping.clear();
+        request.slot_mapping.reserve(static_cast<size_t>(chunk_new));
+        for(int t = cached_tokens; t < new_len; ++t)
+        {
+            int pb = request.block_table[t / blk_size];
+            request.slot_mapping.push_back(pb * blk_size + (t % blk_size));
+        }
+        request.sequence_length = new_len;
+        request.num_computed_tokens = new_len;
+        request.num_cached_blocks = matched_blocks_num;
+
+        // 把本 chunk 刚刚写满的块登记进前缀缓存
+        manager.register_block(request, matched_blocks_num);
+        if(out_cached_tokens) *out_cached_tokens = cached_tokens;
+        if(out_computed_tokens) *out_computed_tokens = chunk_new;
+        return true;
+    }
+
+    // 情况 2：续算分块（0 < num_computed_tokens < total_tokens）
+    const int old_len = request.num_computed_tokens;
+    const int remaining = std::max(0, total_tokens - old_len);
+    const int chunk_new = (num_new_tokens > 0) ? std::min(remaining, num_new_tokens) : remaining;
+    if(chunk_new == 0) return true;
+
+    const int new_len = old_len + chunk_new;
+    const int old_blocks = static_cast<int>(request.block_table.size());
+    const int target_blocks = (new_len + blk_size - 1) / blk_size;
+
+    // 若尾块未满且被共享（防御性 CoW），先分裂尾块
+    const int tail_offset = old_len % blk_size;
+    if(tail_offset != 0 && !request.block_table.empty())
+    {
+        int tail_phys = request.block_table.back();
+        if(allocator->get_block(tail_phys).ref_count > 1)
+        {
+            int cow_id = manager.allocate_block();
+            if(cow_id < 0) return false;
+            request.block_table.back() = cow_id;
+            manager.record_cow_copy(tail_offset);
+            allocator->dec_ref(tail_phys);
+        }
+    }
+
+    for(int i = old_blocks; i < target_blocks; ++i)
+    {
+        int new_id = manager.allocate_block();
+        if(new_id < 0)
+        {
+            // 回滚本次续算新分配的块，保持 old_len 状态一致
+            while(static_cast<int>(request.block_table.size()) > old_blocks)
+            {
+                allocator->dec_ref(request.block_table.back());
+                request.block_table.pop_back();
+            }
+            return false;
+        }
+        request.block_table.push_back(new_id);
+    }
+
+    request.slot_mapping.clear();
+    request.slot_mapping.reserve(static_cast<size_t>(chunk_new));
+    for(int t = old_len; t < new_len; ++t)
+    {
+        int pb = request.block_table[t / blk_size];
+        request.slot_mapping.push_back(pb * blk_size + (t % blk_size));
+    }
+    request.sequence_length = new_len;
+    request.num_computed_tokens = new_len;
+
+    // 增量注册本 chunk 新写满的块
+    manager.register_block(request, request.num_cached_blocks);
+    if(out_computed_tokens) *out_computed_tokens = chunk_new;
     return true;
 }
 
@@ -133,6 +255,7 @@ void append_token(BlockManager& manager, Request& request, int token)
     }
 
     request.sequence_length += 1;
+    request.num_computed_tokens += 1;
 
     // 块刚好写满，注册进前缀缓存
     if(request.sequence_length % blk_size == 0)

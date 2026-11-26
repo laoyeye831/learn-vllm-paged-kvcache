@@ -330,6 +330,205 @@ void test_sched_watermark_ratio_aborts_oversized()
     EXPECT_EQ(alloc.num_free_blocks(), 16);
 }
 
+// =========================================================
+// v0.4.0：Schedule/Execute 解耦与 Chunked Prefill + Token Budget
+// =========================================================
+
+void test_sched_decoupled_schedule_execute()
+{
+    BlockAllocator alloc(32, 16);
+    BlockManager mgr(&alloc);
+    Scheduler sched(mgr);
+    sched.set_sampler(fake_sample);
+
+    auto r = make_request(32, 1000, 4);
+    sched.add_request(r);
+
+    // 第 1 步：schedule() 准入并 prefill 32 token，无 decode
+    SchedulerOutput out1 = sched.schedule();
+    EXPECT_EQ((int)out1.prefill_reqs.size(), 1);
+    EXPECT_EQ(out1.num_prefill_tokens, 32);
+    EXPECT_EQ(out1.num_decode_tokens, 0);
+    sched.execute(out1);
+    EXPECT_EQ(sched.last_step_prefill_tokens(), 32);
+    EXPECT_EQ(sched.last_step_decode_tokens(), 0);
+    EXPECT_EQ(r->num_generated_tokens, 0);
+
+    // 第 2 步：schedule() 调度 1 个 decode token
+    SchedulerOutput out2 = sched.schedule();
+    EXPECT_EQ(out2.num_prefill_tokens, 0);
+    EXPECT_EQ(out2.num_decode_tokens, 1);
+    sched.execute(out2);
+    EXPECT_EQ(r->num_generated_tokens, 1);
+
+    // 跑完剩余步骤
+    while(sched.has_work())
+    {
+        auto out = sched.schedule();
+        sched.execute(out);
+    }
+    EXPECT_TRUE(r->s == ReqState::FINISHED);
+    EXPECT_EQ(r->num_generated_tokens, 4);
+    EXPECT_EQ(alloc.num_free_blocks(), 32);
+}
+
+void test_sched_chunked_prefill_basic()
+{
+    // 100 token prompt，单步预算 32 → 应拆成 32 + 32 + 32 + 4 四步 prefill，输出与非分块完全一致
+    auto prompt = tokens_range(100, 500);
+    auto baseline = run_batch(64, {prompt}, 10);
+
+    BlockAllocator alloc(64, 16);
+    BlockManager mgr(&alloc);
+    SchedulerConfig cfg;
+    cfg.max_num_batched_tokens = 32;
+    cfg.enable_chunked_prefill = true;
+    Scheduler sched(mgr, cfg);
+    sched.set_sampler(fake_sample);
+    sched.set_step_hook([&](const Scheduler& s)
+                        { check_invariants(s, alloc, &mgr); });
+
+    auto r = std::make_shared<Request>();
+    r->all_tokens = prompt;
+    r->max_new_tokens = 10;
+    sched.add_request(r);
+
+    std::vector<int> prefill_chunks;
+    while(sched.has_work())
+    {
+        auto out = sched.schedule();
+        EXPECT_TRUE(out.total_scheduled_tokens() <= 32);
+        if(out.num_prefill_tokens > 0) prefill_chunks.push_back(out.num_prefill_tokens);
+        sched.execute(out);
+    }
+
+    EXPECT_EQ(prefill_chunks, (std::vector<int>{32, 32, 32, 4}));
+    EXPECT_TRUE(r->s == ReqState::FINISHED);
+    EXPECT_EQ(r->all_tokens, baseline.reqs[0]->all_tokens);
+    EXPECT_EQ(alloc.num_free_blocks(), 64);
+}
+
+void test_sched_chunked_prefill_mixed_with_decode()
+{
+    // 2 个短请求正在 decode 时，1 个 96-token 长请求到达；budget=20 应实现 decode + prefill chunk 同批混排
+    BlockAllocator alloc(64, 16);
+    BlockManager mgr(&alloc);
+    SchedulerConfig cfg;
+    cfg.max_num_batched_tokens = 20;
+    cfg.enable_chunked_prefill = true;
+    Scheduler sched(mgr, cfg);
+    sched.set_sampler(fake_sample);
+    sched.set_step_hook([&](const Scheduler& s)
+                        { check_invariants(s, alloc, &mgr); });
+
+    auto d1 = make_request(8, 1000, 10);
+    auto d2 = make_request(8, 2000, 10);
+    sched.add_request(d1);
+    sched.add_request(d2);
+    sched.step(); // 首步完成 d1/d2 的 prefill（共 16 token <= 20）
+
+    // 注入长 prompt 请求
+    auto long_req = make_request(96, 5000, 5);
+    sched.add_request(long_req);
+
+    bool saw_mixed_batch = false;
+    while(sched.has_work())
+    {
+        auto out = sched.schedule();
+        EXPECT_TRUE(out.total_scheduled_tokens() <= 20);
+        if(out.num_decode_tokens == 2 && out.num_prefill_tokens == 18) saw_mixed_batch = true;
+        sched.execute(out);
+    }
+    EXPECT_TRUE(saw_mixed_batch);
+    EXPECT_TRUE(d1->s == ReqState::FINISHED);
+    EXPECT_TRUE(d2->s == ReqState::FINISHED);
+    EXPECT_TRUE(long_req->s == ReqState::FINISHED);
+    EXPECT_EQ(alloc.num_free_blocks(), 64);
+}
+
+void test_sched_preempt_mid_chunked_prefill()
+{
+    // 紧池（12 块，watermark=2）+ 分块预填充（budget=16）：
+    // 多个长 prompt 同时进入分块预填充，必然在“prefill 到一半”时触发抢占，
+    // 验证不触发断言崩溃、不变量始终成立，且最终输出与大池基线逐 token 一致。
+    std::vector<std::vector<int>> prompts = {
+        tokens_range(64, 1000),
+        tokens_range(64, 2000),
+        tokens_range(64, 3000),
+        tokens_range(64, 4000)};
+    auto big = run_batch(128, prompts, 16);
+
+    BlockAllocator alloc(12, 16);
+    BlockManager mgr(&alloc);
+    SchedulerConfig cfg;
+    cfg.watermark_blocks = 2;
+    cfg.max_num_batched_tokens = 16;
+    cfg.enable_chunked_prefill = true;
+    Scheduler sched(mgr, cfg);
+    sched.set_sampler(fake_sample);
+    sched.set_step_hook([&](const Scheduler& s)
+                        { check_invariants(s, alloc, &mgr); });
+
+    std::vector<std::shared_ptr<Request>> reqs;
+    for(const auto& p : prompts)
+    {
+        auto r = std::make_shared<Request>();
+        r->all_tokens = p;
+        r->max_new_tokens = 16;
+        reqs.push_back(r);
+        sched.add_request(r);
+    }
+
+    int steps = run_until_done(sched, 20000);
+    EXPECT_TRUE(steps > 0);
+    EXPECT_TRUE(sched.num_preemptions() > 0);
+    for(size_t i = 0; i < reqs.size(); ++i)
+    {
+        EXPECT_TRUE(reqs[i]->s == ReqState::FINISHED);
+        EXPECT_EQ(reqs[i]->all_tokens, big.reqs[i]->all_tokens);
+    }
+    EXPECT_EQ(alloc.num_free_blocks(), 12);
+}
+
+void test_sched_max_num_seqs_and_waiting_reserve()
+{
+    // max_num_seqs=2 限制并发 running 上限；waiting_token_reserve=8 防止长 chunked prefill 饿死等待队列
+    BlockAllocator alloc(64, 16);
+    BlockManager mgr(&alloc);
+    SchedulerConfig cfg;
+    cfg.max_num_batched_tokens = 32;
+    cfg.max_num_seqs = 2;
+    cfg.enable_chunked_prefill = true;
+    cfg.waiting_token_reserve = 8;
+    Scheduler sched(mgr, cfg);
+    sched.set_sampler(fake_sample);
+
+    auto r1 = make_request(80, 1000, 4); // 长 prompt
+    auto r2 = make_request(8, 2000, 4);  // 短 prompt
+    auto r3 = make_request(8, 3000, 4);  // 第 3 个请求，应被 max_num_seqs=2 挡在 waiting
+    sched.add_request(r1);
+    sched.add_request(r2);
+    sched.add_request(r3);
+
+    // 第 1 步：r1 先拿 32 token（剩余 48）；r2 还没进
+    sched.step();
+    EXPECT_TRUE((int)sched.running().size() <= 2);
+
+    // 第 2 步：因为 waiting_token_reserve=8，r1 续算最多拿 32-8=24 token，留出 8 token 让 r2 立刻准入！
+    auto out2 = sched.schedule();
+    EXPECT_TRUE(out2.total_scheduled_tokens() <= 32);
+    EXPECT_EQ((int)sched.running().size(), 2); // r1 + r2 已同时在 running，r3 被 max_num_seqs=2 挡住
+    EXPECT_EQ((int)sched.waiting().size(), 1);
+    sched.execute(out2);
+
+    int steps = run_until_done(sched);
+    EXPECT_TRUE(steps > 0);
+    EXPECT_TRUE(r1->s == ReqState::FINISHED);
+    EXPECT_TRUE(r2->s == ReqState::FINISHED);
+    EXPECT_TRUE(r3->s == ReqState::FINISHED);
+    EXPECT_EQ(alloc.num_free_blocks(), 64);
+}
+
 int main()
 {
     std::cout << "========== 阶段四：Scheduler（Recompute 抢占与接纳） ==========\n";
@@ -346,6 +545,13 @@ int main()
     RUN_TEST(test_sched_preempted_request_resumes_first);
     RUN_TEST(test_sched_custom_block_size_and_watermark);
     RUN_TEST(test_sched_watermark_ratio_aborts_oversized);
+
+    std::cout << "\n========== v0.4.0：Schedule/Execute 与 Chunked Prefill ==========\n";
+    RUN_TEST(test_sched_decoupled_schedule_execute);
+    RUN_TEST(test_sched_chunked_prefill_basic);
+    RUN_TEST(test_sched_chunked_prefill_mixed_with_decode);
+    RUN_TEST(test_sched_preempt_mid_chunked_prefill);
+    RUN_TEST(test_sched_max_num_seqs_and_waiting_reserve);
 
     if(g_fail_count == 0)
     {

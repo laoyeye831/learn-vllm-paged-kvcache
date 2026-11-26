@@ -229,13 +229,15 @@ clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
 This is a study project; the following are **deliberate simplifications**, not bugs waiting to be fixed:
 
 - **No real KV data.** The copy-on-write branch of `append_slot()` only increments `BlockManager::num_cow_copies()` / `num_cow_tokens()`; no tensors are moved. Blocks carry metadata only.
-- **No CPU swap.** Preemption uses release-and-recompute (which requires `all_tokens.size() == sequence_length`, i.e. a replayable prompt). The `SWAPPED` state exists but is unused.
+- **Recompute-only preemption.** `SWAPPED` has been removed (matching vLLM v1); preemption releases blocks and lets `match_prefix()` revive any surviving cached blocks on resume.
 - **Placeholder sampler.** `fake_sample()` is a deterministic hash so results can be compared token by token; no model is involved.
 - **No hash-collision fallback.** The 64-bit polynomial hash makes collisions vanishingly unlikely, but they are not otherwise guarded.
 
-## Benchmark (FIFO vs LRU vs Prefix Off)
+## Benchmark
 
-Run `./build/kvcache_bench --sweep` (`seed=42`, `block_size=16`, supports `--workload sysprompt|chat|zipf`, `--blocks N`, `--policy fifo|lru`, `--prefix on|off`, `--csv`):
+### 1. Prefix Caching & Eviction (`./build/kvcache_bench --sweep`)
+
+Default `seed=42`, `block_size=16`, supports `--workload sysprompt|chat|zipf|mixed`, `--blocks N`, `--policy fifo|lru`, `--prefix on|off`, `--csv`:
 
 | workload | blocks | policy / prefix | hit% | evictions | revivals | preempt | steps | tok/step |
 |---|---:|---|---:|---:|---:|---:|---:|---:|
@@ -251,6 +253,17 @@ Run `./build/kvcache_bench --sweep` (`seed=42`, `block_size=16`, supports `--wor
 | `zipf` | 48 | `fifo` + prefix | 61.1% | 158 | 64 | 0 | 250 | 3.73 |
 | `zipf` | 48 | `lru` + prefix | **64.4%** | **139** | **76** | 0 | 250 | 3.73 |
 
+### 2. Chunked Prefill + Token Budget (`./build/kvcache_bench --chunked-sweep`)
+
+`mixed` workload (80% short-prompt decode-heavy + 20% 384–512 token long prompts, `blocks=256`, `max_num_seqs=16`, deterministic step-cost model `5ms + 0.25ms/token`):
+
+| chunked | token budget | avg TTFT (ms) | p99 TTFT (ms) | ITL p50 (ms) | ITL p99 (ms) | Throughput (tok/s) |
+|---|---:|---:|---:|---:|---:|---:|
+| `off` | unlimited | 76.7 | 148.5 | 8.0 | 139.5 | 639.6 |
+| `on` | 128 | 78.4 | 180.8 | 8.2 | **37.0 (-73.5%)** | 635.3 |
+| `on` | 64 | 122.1 | 250.5 | 21.0 | **21.0 (-84.9%)** | 630.0 |
+| `on` | 32 | 719.9 | 1383.8 | 13.0 | **13.0 (-90.7%)** | 542.8 |
+
 ## Roadmap
 
 - [x] `examples/demo.cpp`: demonstrate prefix reuse, copy-on-write and preemption
@@ -262,7 +275,7 @@ Run `./build/kvcache_bench --sweep` (`seed=42`, `block_size=16`, supports `--wor
 - [x] Zero-copy prefix hashing + O(1) incremental `register_block` and full `running_mutex_` lock coverage
 - [x] O(1) intrusive free list and 3-state LRU eviction (CLEAN-first + CACHED LRU + eager hash cleanup)
 - [x] Cache/eviction metrics and reproducible `bench/kvcache_bench.cpp` (FIFO vs LRU vs Prefix Off)
-- [ ] Explore Chunked Prefill / token budget (or GPU ↔ CPU swap comparison)
+- [x] Decoupled `schedule()` / `execute()` (`SchedulerOutput`), removed `SWAPPED`, Chunked Prefill + Token Budget with TTFT/ITL benchmark
 
 ## Disclaimer
 

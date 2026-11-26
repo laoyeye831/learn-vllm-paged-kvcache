@@ -230,13 +230,15 @@ clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
 这是学习项目，以下部分是**刻意简化**的，不是待修复的 bug：
 
 - **没有真实 KV 数据**：`append_slot()` 的 CoW 分支仅通过 `BlockManager::num_cow_copies()` / `num_cow_tokens()` 计数，不搬运 tensor；每个块只记录元信息。
-- **没有 swap 到 CPU**：抢占走「释放 + 重算」路径（要求 `all_tokens.size() == sequence_length`，即 prompt 可重放），不实现 Swapped 状态。
+- **仅保留 Recompute 抢占**：已移除 `SWAPPED`（与 vLLM v1 一致，不做 CPU 换出）；抢占释放块后由 `match_prefix()` 复用存活满块并重算剩余部分。
 - **采样器是占位实现**：`fake_sample()` 是一个确定性哈希函数，用于让结果可对拍，不涉及任何模型。
 - **哈希无碰撞兜底**：链式多项式哈希 64 位，理论碰撞概率极低但未做额外校验。
 
-## Benchmark（FIFO vs LRU vs Prefix Off）
+## Benchmark
 
-构建后可运行 `./build/kvcache_bench --sweep`（默认 `seed=42`，`block_size=16`，支持 `--workload sysprompt|chat|zipf`、`--blocks N`、`--policy fifo|lru`、`--prefix on|off`、`--csv`）：
+### 1. 前缀缓存与淘汰策略（`./build/kvcache_bench --sweep`）
+
+默认 `seed=42`，`block_size=16`，支持 `--workload sysprompt|chat|zipf|mixed`、`--blocks N`、`--policy fifo|lru`、`--prefix on|off`、`--csv`：
 
 | workload | blocks | policy / prefix | hit% | evictions | revivals | preempt | steps | tok/step |
 |---|---:|---|---:|---:|---:|---:|---:|---:|
@@ -252,6 +254,17 @@ clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
 | `zipf` | 48 | `fifo` + prefix | 61.1% | 158 | 64 | 0 | 250 | 3.73 |
 | `zipf` | 48 | `lru` + prefix | **64.4%** | **139** | **76** | 0 | 250 | 3.73 |
 
+### 2. Chunked Prefill + Token Budget（`./build/kvcache_bench --chunked-sweep`）
+
+`mixed` 长短混合负载（80% 短 prompt 长 decode + 20% 384–512 token 长 prompt，`blocks=256`，`max_num_seqs=16`，step-cost 模拟时钟 `5ms + 0.25ms/token`）：
+
+| chunked | token budget | avg TTFT (ms) | p99 TTFT (ms) | ITL p50 (ms) | ITL p99 (ms) | Throughput (tok/s) |
+|---|---:|---:|---:|---:|---:|---:|
+| `off` | unlimited | 76.7 | 148.5 | 8.0 | 139.5 | 639.6 |
+| `on` | 128 | 78.4 | 180.8 | 8.2 | **37.0 (-73.5%)** | 635.3 |
+| `on` | 64 | 122.1 | 250.5 | 21.0 | **21.0 (-84.9%)** | 630.0 |
+| `on` | 32 | 719.9 | 1383.8 | 13.0 | **13.0 (-90.7%)** | 542.8 |
+
 ## Roadmap
 
 - [x] `examples/demo.cpp`：演示前缀复用、写时复制与抢占
@@ -263,7 +276,7 @@ clang-format -i include/kvcache.h src/*.cpp tests/*.cpp tests/*.h examples/*.cpp
 - [x] 前缀哈希零拷贝 + `register_block` $O(1)$ 增量计算，补齐队列并发观察锁保护
 - [x] 引入 $O(1)$ 侵入式双向链表与三态 LRU 淘汰（CLEAN 优先 + CACHED LRU + 主动清理哈希表）
 - [x] 指标统计与 `bench/kvcache_bench.cpp` 对照基准（FIFO vs LRU vs Prefix Off）
-- [ ] 探索 Chunked Prefill / Token Budget（或 GPU ↔ CPU swap 对比）
+- [x] Schedule / Execute 解耦（`SchedulerOutput`）、移除 `SWAPPED`、Chunked Prefill + Token Budget 与 TTFT/ITL 对比基准
 
 ## 声明
 

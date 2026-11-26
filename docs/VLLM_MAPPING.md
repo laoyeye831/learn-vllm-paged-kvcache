@@ -2,7 +2,7 @@
 
 本项目是 vLLM 内存管理与调度层的 C++ 复现。下表逐条列出「本项目的符号 ↔ vLLM 中的位置 ↔ 差异」。
 
-**参考版本**：主体对照 vLLM **v0 架构**（`vllm/core/`，0.5 前后的代码组织），因为本项目的 `ReqState::SWAPPED`、`prefix_caching_block` 式的哈希表、以及 `_schedule_*` 四阶段拆分都源于这一代设计。vLLM v1（`vllm/v1/`）把 block manager 重构成了 `KVCacheManager` + `BlockPool`，表中给出对应位置仅供参考——**上游重构频繁，文件名可能随版本变动**。
+**参考版本**：早期 v0.1.0 对照 vLLM **v0 架构**（`vllm/core/`），从 v0.3.0 / v0.4.0 起已全面向 **vLLM v1 架构**（`vllm/v1/`）靠拢：包括 `FreeKVCacheBlockQueue` 式的 $O(1)$ 侵入式 LRU 空闲队列、移除 `SWAPPED`、将调度拆分为 `schedule() -> SchedulerOutput` 与 `execute()`、以及 **Chunked Prefill + Token Budget** 混排调度。表中同时保留 v0/v1 对应位置供对照参考。
 
 > 本项目不含 `PagedAttention` 的 CUDA kernel，也不含模型前向。对照的是「块管理 + 调度」这一层。
 
@@ -12,7 +12,7 @@
 |---|---|---|---|
 | `PhysicalBlock` | `vllm/core/block/interfaces.py: PhysicalTokenBlock` | `vllm/v1/core/block_pool.py: KVCacheBlock` | 只保留元信息（ref/hash/时间戳），没有真实 KV tensor 与 block_id 的指针 |
 | `Request` | `vllm/sequence.py: Sequence` / `SequenceGroup` | `vllm/v1/request.py: Request` | 去掉了 sampling params、LoRA、多序列组等，只留 block_table / slot_mapping / 生成长度 |
-| `ReqState` | `vllm/sequence.py: SequenceStatus` | `vllm/v1/request.py: RequestStatus` | 保留了 `SWAPPED` 但未使用（本项目不做 CPU 换出） |
+| `ReqState` | `vllm/sequence.py: SequenceStatus` | `vllm/v1/request.py: RequestStatus` | v0.4.0 已移除 `SWAPPED`，与 vLLM v1 一致仅保留 Recompute 路径 |
 | `BlockAllocator` | `vllm/core/block/common.py: BlockAllocator`<br/>`vllm/core/block/naive_block.py: NaiveBlockAllocator` | `vllm/v1/core/block_pool.py: BlockPool` | 只做单设备、单池；没有 `device=CPU/GPU` 双池，也没有 `cached_block_hash_to_block` |
 | `free_head_` / `free_tail_` + 侵入式链表 | `NaiveBlockAllocator._free_blocks`（`deque`） | `BlockPool.free_block_queue`（`FreeKVCacheBlockQueue` 侵入式双向链表 + LRU） | v0.3.0 已升级为 $O(1)$ 侵入式双向链表，支持 `FreePolicy::LRU`（CLEAN 前缀 + CACHED 后缀）与 `FreePolicy::FIFO` 对照 |
 | `ref_count` | `PhysicalTokenBlock.ref_count` | `KVCacheBlock.ref_cnt` | 语义一致（含 `<=1` 表示不会被共享） |
@@ -54,7 +54,7 @@
 | `preempt()` | `Scheduler._preempt` | 一致：抢占**最后到达**的请求（`policy = RECOMPUTE`），释放块、放回等待队列队首。Recovery 顺序（`_get_swapped_and_blocked_queue` / `waiting` 的 TTL 排序）在本项目简化为「队首优先」 |
 | `step()` 阶段三（准入） | `Scheduler._schedule_prefills` | 关键行为一致：**空间不足时 `break`**，不跳过队首去塞后面的小请求（vLLM 源码注释也是这个理由：避免大请求饥饿） |
 | 「没抢占才准入新请求」 | vLLM 用 `preempted` 标志位做同样的短路 | 本项目显式记录 `bool preempted` |
-| `step()` 阶段四（执行） | `Scheduler._schedule_*` 返回 `SchedulerOutput` 后交给 `execute_model` | 本项目直接在同一步内采样并 `append_token`，没有 `SchedulerOutput` 这一层抽象，也没有流水线重叠（vLLM 的 CPU 调度与 GPU 计算是流水化的） |
+| `Scheduler::schedule()` / `execute()` + `SchedulerOutput` | `Scheduler._schedule_*` → `SchedulerOutputs` → `execute_model` | `vllm/v1/core/sched/scheduler.py: Scheduler.schedule()` → `SchedulerOutput` | v0.4.0 已解耦决策与执行，并支持 `max_num_batched_tokens`、`max_num_seqs`、`enable_chunked_prefill` 与 `waiting_token_reserve` |
 | `num_preemptions_` / `num_steps_` | vLLM 有 metrics（`vllm/engine/metrics.py`） | 只保留两个计数器，无 Prometheus 暴露 |
 | `abort_all_pending()` | `Scheduler.abort_seq_group` + 引擎停机流程 | 本项目在停机时统一中止，并保证所有 `future` 就绪 |
 
@@ -71,8 +71,8 @@
 
 | vLLM 特性 | 本项目状态 |
 |---|---|
-| CPU ↔ GPU swap（`_swap_out` / `_swap_in`） | ❌ 只做「释放 + 重算」，`ReqState::SWAPPED` 未被使用 |
-| Chunked prefill | ❌ prefill 必须一次装下整个 prompt |
+| CPU ↔ GPU swap（`_swap_out` / `_swap_in`） | ❌ 已移除（vLLM v1 同样移除了 CPU Swap，仅保留 Recompute） |
+| Chunked prefill + Token Budget | ✅ v0.4.0 已实现 `prefill_chunk()`、running-first 预算分配、`max_num_seqs` 与 `waiting_token_reserve` |
 | LRU 空闲块淘汰 | ✅ v0.3.0 已实现 $O(1)$ 侵入式链表 LRU（CLEAN 优先 + CACHED LRU）及 FIFO 对照 |
 | 真实 PagedAttention kernel / `copy_blocks` | ❌ KV 内容用整数模拟 |
 | 多设备 / TP / PP | ❌ 单设备单池 |

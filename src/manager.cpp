@@ -136,22 +136,9 @@ void BlockManager::release(Request& req)
     req.block_table.clear();
     req.slot_mapping.clear();
     req.sequence_length = 0;
+    req.num_computed_tokens = 0;
     req.num_cached_blocks = 0;
 }
-
-void BlockManager::record_prefill_stats(int prompt_token_count, int query_blocks, int hit_blocks)
-{
-    if(prompt_token_count > 0) prompt_tokens_ += static_cast<uint64_t>(prompt_token_count);
-    if(query_blocks > 0) prefix_cache_queries_ += static_cast<uint64_t>(query_blocks);
-    if(hit_blocks > 0) prefix_cache_hits_ += static_cast<uint64_t>(hit_blocks);
-}
-
-void BlockManager::record_cow_copy(int copied_tokens)
-{
-    ++num_cow_copies_;
-    if(copied_tokens > 0) num_cow_tokens_ += static_cast<uint64_t>(copied_tokens);
-}
-
 
 void BlockManager::record_prefill_stats(int prompt_token_count, int query_blocks, int hit_blocks)
 {

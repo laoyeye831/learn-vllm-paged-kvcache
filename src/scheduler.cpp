@@ -1,5 +1,6 @@
 #include "kvcache.h"
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <memory>
 #include <string>
@@ -9,13 +10,16 @@
 
 // ====== 调度策略 ======
 Scheduler::Scheduler(BlockManager& manager, int num_workers)
-    : Scheduler(manager, SchedulerConfig{num_workers, DEFAULT_WATER_MARK, -1.0}) {}
+    : Scheduler(manager, SchedulerConfig{num_workers, DEFAULT_WATER_MARK, -1.0, 0, 0, true, 0}) {}
 
 Scheduler::Scheduler(BlockManager& manager, SchedulerConfig config)
     : manager_(manager), config_(config), num_workers_(config.num_workers > 0 ? config.num_workers : 1)
 {
     config_.num_workers = num_workers_;
     if(config_.watermark_blocks < 0) config_.watermark_blocks = 0;
+    if(config_.max_num_batched_tokens < 0) config_.max_num_batched_tokens = 0;
+    if(config_.max_num_seqs < 0) config_.max_num_seqs = 0;
+    if(config_.waiting_token_reserve < 0) config_.waiting_token_reserve = 0;
 }
 
 int Scheduler::watermark_blocks() const
@@ -139,10 +143,13 @@ int Scheduler::blocks_needed_for_prefill(std::shared_ptr<Request> req)
 
 void Scheduler::preempt()
 {
-    // 前提条件：能重算，不满足就是逻辑bug，直接断言
+    // 分块预填充下，running_queue_ 中的请求可能处于“prefill 到一半”状态
+    // （num_computed_tokens < all_tokens.size()），因此前置条件为 num_computed_tokens <= all_tokens.size()。
+    // 抢占只释放物理块并清零 num_computed_tokens；已登记进前缀缓存的满块仍留在 CACHED 空闲链表中，
+    // 下次恢复时 match_prefix() 会自动复用存活块并从断点续算剩余 chunk。
     auto victim = running_queue_.back();
-    bool re_com_able = (static_cast<int>(victim->all_tokens.size()) == victim->sequence_length);
-    assert(re_com_able && "preempt: victim cannot be recomputed, invalid precondition");
+    assert(victim->num_computed_tokens <= static_cast<int>(victim->all_tokens.size()) &&
+           "preempt: victim cannot be recomputed, invalid precondition");
 
     // 释放victim的资源
     manager_.release(*victim);
@@ -237,19 +244,39 @@ void Scheduler::sample_batch_parallel(const std::vector<std::shared_ptr<Request>
         std::rethrow_exception(e);
     }
 }
+SchedulerOutput Scheduler::schedule()
+{
+    std::lock_guard<std::mutex> step_lock(step_mutex_);
+    return schedule_locked();
+}
+
+void Scheduler::execute(SchedulerOutput& output)
+{
+    std::lock_guard<std::mutex> step_lock(step_mutex_);
+    execute_locked(output);
+}
+
 void Scheduler::step()
 {
     std::lock_guard<std::mutex> step_lock(step_mutex_); // 同一时刻只允许一个线程推进调度
+    SchedulerOutput output = schedule_locked();
+    execute_locked(output);
+}
 
+SchedulerOutput Scheduler::schedule_locked()
+{
+    SchedulerOutput output;
     BlockAllocator* allocator = manager_.get_allocator();
     const int num_blocks = allocator->num_blocks();
     const int blk_size = manager_.block_size();
     const int watermark = watermark_blocks();
+    const int cur_step = static_cast<int>(num_steps_.load());
 
-    // 阶段一：先清空收件箱进入waiting_queue
-    // 本步内完成的 promise 统一收集，等到 step() 末尾（step_hook_ 之后）再唤醒，
-    // 否则等待者可能与本线程的 step_hook_ 并发访问同一份统计状态（TSan: data race）
-    std::vector<PendingCompletion> finished;
+    const bool has_token_budget = (config_.max_num_batched_tokens > 0);
+    const bool chunked = (has_token_budget && config_.enable_chunked_prefill);
+
+    // 阶段一：先清空收件箱进入 waiting_queue_
+    // 本步内准入拒绝的 promise 放入 output.aborted_promises，统一由 execute_locked 在 step_hook_ 之后锁外唤醒
     {
         std::unique_lock<std::mutex> lock(sched_mutex_);     // 对inbox_操作（与add_request竞争）
         std::unique_lock<std::mutex> lock_p(pending_mutex_); // 对pending_操作
@@ -264,7 +291,7 @@ void Scheduler::step()
                 int id = (*temp)->arrival_id;
                 (*temp)->s = ReqState::ABORTED;
                 auto node = pending_.extract(id);
-                if(!node.empty()) finished.push_back(std::move(node.mapped()));
+                if(!node.empty()) output.aborted_promises.push_back(std::move(node.mapped().done));
                 inbox_.erase(temp);
                 unfinished--;
                 continue;
@@ -273,95 +300,187 @@ void Scheduler::step()
             inbox_.erase(temp);
         }
     }
-    // 阶段二：挨个看看是否该抢占（固定锁顺序：running_mutex_ -> waiting_mutex_）
-    bool preempted = false;
-    std::vector<std::shared_ptr<Request>> batch; // 本step能执行的请求
+
+    int remaining_budget = chunked ? config_.max_num_batched_tokens : INT_MAX;
+
+    // 阶段二：running 优先（处理正在 decode 或续算 chunked prefill 的请求，必要时抢占队尾）
+    // 严格遵守全局锁顺序：running_mutex_ -> waiting_mutex_
     {
         std::unique_lock<std::mutex> lock_r(running_mutex_);
         std::unique_lock<std::mutex> lock_w(waiting_mutex_);
+
+        // 若配置了 waiting_token_reserve 且 waiting 队列有资格准入，为新请求保留一小份预算防饥饿
+        int reserve = 0;
+        if(chunked && config_.waiting_token_reserve > 0 && !waiting_queue_.empty() &&
+           (config_.max_num_seqs <= 0 || static_cast<int>(running_queue_.size()) < config_.max_num_seqs))
+        {
+            reserve = std::min(config_.waiting_token_reserve, std::max(0, config_.max_num_batched_tokens - 1));
+        }
+        int running_budget = chunked ? (remaining_budget - reserve) : INT_MAX;
+
         for(size_t i = 0; i < running_queue_.size(); ++i)
         {
-            while(!can_append(running_queue_[i]))
+            if(chunked && running_budget <= 0) break;
+
+            auto req = running_queue_[i];
+            if(!req->is_prefill_done())
             {
-                preempt();
-                preempted = true;
-                if(i >= running_queue_.size()) break; // 抢占自己不行
+                // 分块预填充续算分支
+                int rem_prefill = static_cast<int>(req->all_tokens.size()) - req->num_computed_tokens;
+                int chunk_new = chunked ? std::min(rem_prefill, running_budget) : rem_prefill;
+                if(chunk_new <= 0) continue;
+
+                int old_len = req->num_computed_tokens;
+                int target_blocks = (old_len + chunk_new + blk_size - 1) / blk_size;
+                int extra_blocks = std::max(0, target_blocks - static_cast<int>(req->block_table.size()));
+                if(old_len % blk_size != 0 && !req->block_table.empty() &&
+                   allocator->get_block(req->block_table.back()).ref_count > 1)
+                {
+                    ++extra_blocks; // 防御性 CoW 所需块
+                }
+
+                while(allocator->num_free_blocks() < extra_blocks)
+                {
+                    preempt();
+                    output.preempted = true;
+                    ++output.num_preemptions;
+                    if(i >= running_queue_.size()) break;
+                }
+                if(i < running_queue_.size())
+                {
+                    int computed = 0;
+                    bool ok = prefill_chunk(*req, chunk_new, manager_, nullptr, nullptr, &computed);
+                    assert(ok);
+                    output.prefill_reqs.push_back(SchedulerOutput::ScheduledPrefill{req, 0, computed, false});
+                    output.num_prefill_tokens += computed;
+                    if(chunked)
+                    {
+                        running_budget -= computed;
+                        remaining_budget -= computed;
+                    }
+                }
             }
-            if(i < running_queue_.size())
+            else
             {
-                append_slot(manager_, *running_queue_[i]);
-                batch.push_back(running_queue_[i]);
+                // Decode 分支：每请求消耗 1 token 预算
+                while(!can_append(req))
+                {
+                    preempt();
+                    output.preempted = true;
+                    ++output.num_preemptions;
+                    if(i >= running_queue_.size()) break; // 抢占自己不行
+                }
+                if(i < running_queue_.size())
+                {
+                    append_slot(manager_, *req);
+                    output.decode_reqs.push_back(req);
+                    output.num_decode_tokens += 1;
+                    if(chunked)
+                    {
+                        running_budget -= 1;
+                        remaining_budget -= 1;
+                    }
+                }
             }
         }
     }
 
-    // 阶段三：判断新请求是否该加入进来
-    const int cur_step = static_cast<int>(num_steps_.load());
-    if(!preempted)
+    // 阶段三：准入新请求（仅在阶段二未发生抢占时执行，同时受 max_num_seqs 与 token budget 约束）
+    if(!output.preempted)
     {
-        // 没发生抢占，说明空间还很多，可以加入新的请求
-        // 严格遵守全局锁顺序：running_mutex_ -> waiting_mutex_
         std::unique_lock<std::mutex> lock_r(running_mutex_);
         std::unique_lock<std::mutex> lock_w(waiting_mutex_);
         while(!waiting_queue_.empty())
         {
+            if(config_.max_num_seqs > 0 && static_cast<int>(running_queue_.size()) >= config_.max_num_seqs)
+                break;
+
             auto temp = waiting_queue_.front();
-            // 只算一次 match_prefix，复用到 prefill() 避免重复哈希
-            // 注意：只有 ref_count > 0 的命中块不消耗 num_free_blocks()；
-            //       ref_count == 0 的 CACHED 空闲块被 inc_ref 复活后同样会从空闲链表摘除
+            // 只算一次 match_prefix，复用到 prefill_chunk() 避免重复哈希
             auto match = manager_.match_prefix(temp->all_tokens);
-            int total = (static_cast<int>(temp->all_tokens.size()) + blk_size - 1) / blk_size;
+            const int total_prompt = static_cast<int>(temp->all_tokens.size());
+            const int cached_tokens = match.num_matched_tokens;
+            const int uncached_tokens = std::max(0, total_prompt - cached_tokens);
+
+            int chunk_new = uncached_tokens;
+            if(chunked)
+            {
+                if(uncached_tokens > 0 && remaining_budget <= 0) break;
+                chunk_new = std::min(uncached_tokens, remaining_budget);
+            }
+
+            const int new_len = cached_tokens + chunk_new;
+            const int target_blocks = (new_len + blk_size - 1) / blk_size;
             int active_hit = 0;
             for(int id : match.cached_blocks)
             {
                 if(allocator->get_block(id).ref_count > 0) ++active_hit;
             }
-            int block_needed = total - active_hit;
+            const int block_needed = target_blocks - active_hit;
             if(block_needed + watermark > allocator->num_free_blocks()) break; // 空间不足则停止准入，避免大请求饥饿
-            // prefill新请求，加入running_queue_等待下一轮decode
-            bool ok = prefill(temp->all_tokens, *temp, manager_, &match);
+
+            int out_cached = 0;
+            int out_computed = 0;
+            bool ok = prefill_chunk(*temp, chunk_new, manager_, &match, &out_cached, &out_computed);
             assert(ok);
             temp->s = ReqState::RUNNING;
             if(temp->admit_step < 0) temp->admit_step = cur_step;
             waiting_queue_.pop_front();
             running_queue_.push_back(temp);
-            // 此时先不放入batch，因为没有进行新slot的计算，留着下一轮再decode
+
+            output.prefill_reqs.push_back(SchedulerOutput::ScheduledPrefill{temp, out_cached, out_computed, true});
+            output.num_prefill_tokens += out_computed;
+            if(chunked) remaining_budget -= out_computed;
         }
     }
 
-    // 阶段四：先跑采样（这一步不需要任何锁，Worker 只读 batch、各写各的下标）
-    std::vector<int> new_tokens;
-    sample_batch_parallel(batch, new_tokens);
+    return output;
+}
 
-    // 收集已结束请求的 promise，锁外统一 fire
-    // （finished 中可能已有阶段一被中止的请求，这里不能清空）
+void Scheduler::execute_locked(SchedulerOutput& output)
+{
+    const int cur_step = static_cast<int>(num_steps_.load());
+
+    // 阶段四：先跑并行采样（不持任何锁，Worker 只读 decode_reqs、各写各的下标）
+    std::vector<int> new_tokens;
+    sample_batch_parallel(output.decode_reqs, new_tokens);
+
+    std::vector<std::promise<void>> finished;
+    for(auto& p : output.aborted_promises)
+        finished.push_back(std::move(p));
+    output.aborted_promises.clear();
+
     {
         std::unique_lock<std::mutex> lock_p(pending_mutex_); // 保护 pending_
         std::unique_lock<std::mutex> lock_r(running_mutex_); // 保护 running_queue_
 
-        for(int i = 0; i < (int)batch.size(); i++)
+        for(int i = 0; i < static_cast<int>(output.decode_reqs.size()); i++)
         {
+            auto& req = output.decode_reqs[i];
             int new_token = new_tokens[i];
-            if(batch[i]->first_token_step < 0) batch[i]->first_token_step = cur_step;
-            append_token(manager_, *batch[i], new_token);
-            batch[i]->num_generated_tokens++;
+            if(req->first_token_step < 0) req->first_token_step = cur_step;
+            append_token(manager_, *req, new_token);
+            req->num_generated_tokens++;
 
-            if(batch[i]->num_generated_tokens >= batch[i]->max_new_tokens)
+            if(req->num_generated_tokens >= req->max_new_tokens)
             {
-                batch[i]->finish_step = cur_step;
-                batch[i]->s = ReqState::FINISHED;
-                manager_.release(*batch[i]); // 内部只用 alloc_mutex_，不冲突
+                req->finish_step = cur_step;
+                req->s = ReqState::FINISHED;
+                manager_.release(*req); // 内部只用 alloc_mutex_，不冲突
 
-                auto it = std::find(running_queue_.begin(), running_queue_.end(), batch[i]);
+                auto it = std::find(running_queue_.begin(), running_queue_.end(), req);
                 if(it != running_queue_.end()) running_queue_.erase(it);
                 unfinished--; // 结束就一定减，与队列无关
 
-                auto node = pending_.extract(batch[i]->arrival_id);
-                if(!node.empty()) finished.push_back(std::move(node.mapped()));
+                auto node = pending_.extract(req->arrival_id);
+                if(!node.empty()) finished.push_back(std::move(node.mapped().done));
             }
         }
     }
     // 两把锁在这里析构释放
+
+    last_step_prefill_tokens_.store(output.num_prefill_tokens, std::memory_order_relaxed);
+    last_step_decode_tokens_.store(output.num_decode_tokens, std::memory_order_relaxed);
 
     // 本步到此结束：Worker 已全部收工、锁已释放，可以安全地做检查/统计
     ++num_steps_;
@@ -369,9 +488,9 @@ void Scheduler::step()
 
     // 锁外 set_value：唤醒不再堵 add_request。
     // 必须放在 step_hook_ 之后，保证本步的全部写入都 happens-before 调用方 wait() 返回
-    for(auto& pc : finished)
+    for(auto& p : finished)
     {
-        pc.done.set_value();
+        p.set_value();
     }
     if(!finished.empty() && unfinished.load() == 0) sched_cv_.notify_all();
 }

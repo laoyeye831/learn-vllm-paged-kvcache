@@ -93,8 +93,6 @@ static const char* state_name(ReqState s)
         return "WAITING";
     case ReqState::RUNNING:
         return "RUNNING";
-    case ReqState::SWAPPED:
-        return "SWAPPED";
     case ReqState::FINISHED:
         return "FINISHED";
     case ReqState::ABORTED:

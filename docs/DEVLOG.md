@@ -132,3 +132,16 @@
 - **淘汰清理哈希表的 `it->second == block_id` 守卫**：同一段内容若曾被两个物理块登记，淘汰旧块时不能无条件 `erase(hash)`，必须确认当前映射确实指向被淘汰的块。
 - **`last_accessed` 的打点时机**：为了保证 LRU 空闲链表中 `CACHED` 后缀的 `last_accessed` 单调不减，必须在块归还为空闲（`push_free_locked`）时刷新时间戳，而不仅仅在分配/复活时。
 - **TTFT / TPOT 用步数而非墙钟**：同 seed 下步数指标完全确定，不会被 OS 线程调度噪声淹没，适合做 FIFO vs LRU 的严格 A/B 对照。
+
+---
+
+## Day 9（v0.4.0）
+
+**目标**：移除死枚举 `SWAPPED`、解耦 `schedule()` / `execute()`（`SchedulerOutput`）、落地 Chunked Prefill + Token Budget，并用 benchmark 量化改造前后的 TTFT / ITL p50 / ITL p99 / 吞吐量。
+
+**关键设计决策与踩坑记录**：
+
+- **移除 `SWAPPED`**：vLLM v1 已经在生产架构中移除 CPU Swap，保留死枚举只会增加状态机心智负担；聚焦 Recompute + Chunked Prefill 更贴近现代推理引擎。
+- **抢占前置条件修复**：旧版 `preempt()` 断言 `all_tokens.size() == sequence_length`，上线 chunked prefill 后“prefill 到一半”的请求成为常态，该断言必然崩溃。改为断言 `num_computed_tokens <= all_tokens.size()`，抢占时释放物理块并清零 `num_computed_tokens`，已写满登记的块留在 `CACHED` 链表中，恢复时自动通过 `match_prefix()` 续算。
+- **防止 `waiting` 队列饥饿**：遵循 vLLM 的 running-first 原则，同时把 `max_num_seqs` 与 `max_num_batched_tokens` 分开控制，并增加可选的 `waiting_token_reserve`（钳制在 `max_num_batched_tokens - 1` 以内，保证 running 队列每步至少推进 1 token 不会死锁）。
+- **ITL 模拟基准**：利用 `Scheduler::last_step_scheduled_tokens()` 驱动确定性 step-cost 时钟（`5ms + 0.25ms * tokens`），在 `mixed` 长短混合负载下验证：`budget=128` 时 ITL p99 从 `139.5ms` 降至 `37.0ms`（**-73.5%**），TTFT 仅增 `1.7ms`，吞吐保持在 `99.3%`。
